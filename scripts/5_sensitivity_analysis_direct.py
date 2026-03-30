@@ -10,6 +10,7 @@ Y: damage_cost
 
 # %%
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -25,8 +26,9 @@ import matplotlib.pyplot as plt
 import warnings
 
 warnings.simplefilter("ignore")
-base_path = Path(load_config()["paths"]["base_path"])  # local/processed_data
-res_path = Path(load_config()["paths"]["output_path"])  # local/outputs
+        # Use soge_clusters path instead of base_path
+base_path = Path(load_config()["paths"]["soge_clusters"])  
+res_path = base_path / "results"  # Results directory
 
 
 # %%
@@ -195,17 +197,28 @@ def preprocess(intersections, road_links, lad_shp):
 
 
 # %%
-# Load datasets
+# Load datasets (SUBNETWORK - note: uses base_path which is different from other scripts)
 path = res_path / "damage_analysis" / "revision"
-road_links = gpd.read_parquet(
-    base_path / "networks" / "road" / "GB_road_links_with_bridges.gpq"
+# Using subnetwork files
+road_links_path = (
+    base_path / "networks" / "test_subnetwork" / "GB_road_links_with_bridges_subnetwork.gpq"
 )
-lad_shp = gpd.read_parquet(
+lad_path = (
     base_path
     / "census_datasets"
     / "admin_census_boundary_stats"
     / "gb_lad_2021_estimates.geoparquet"
 )
+
+if not road_links_path.exists() or not lad_path.exists():
+    print(
+        "Direct sensitivity analysis is UK-specific and required files are missing. "
+        f"road_links: {road_links_path.exists()}, lad: {lad_path.exists()}. Skipping."
+    )
+    sys.exit(0)
+
+road_links = gpd.read_parquet(road_links_path)
+lad_shp = gpd.read_parquet(lad_path)
 
 intersections = pd.DataFrame()
 for root, dirs, files in os.walk(path):

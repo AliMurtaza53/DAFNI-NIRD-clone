@@ -6,7 +6,7 @@ from nird.utils import load_config
 import warnings
 
 warnings.simplefilter("ignore")
-base_path = Path(load_config()["paths"]["base_path"])
+base_path = Path(load_config()["paths"]["soge_clusters"])
 
 
 # %%

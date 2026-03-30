@@ -273,6 +273,15 @@ def calculate_damage(
         """
         Helper function to calculate damage fractions and costs for a single row.
         """
+        def _to_float(x):
+            arr = np.asarray(x)
+            if arr.size == 0:
+                return np.nan
+            try:
+                return float(arr.reshape(-1)[0])
+            except Exception:
+                return np.nan
+
         # Compute damage fractions
         curve1, damage_fraction1, curve2, damage_fraction2 = compute_damage_fraction(
             row.road_classification,
@@ -312,14 +321,14 @@ def calculate_damage(
 
         # Return a dictionary of results for easier assignment
         return {
-            f"{curve1}_{flood_type}_damage_fraction": damage_fraction1,
-            f"{curve2}_{flood_type}_damage_fraction": damage_fraction2,
-            f"{curve1}_{flood_type}_damage_value_min": damage_values_1[0],
-            f"{curve1}_{flood_type}_damage_value_max": damage_values_1[1],
-            f"{curve1}_{flood_type}_damage_value_mean": damage_values_1[2],
-            f"{curve2}_{flood_type}_damage_value_min": damage_values_2[0],
-            f"{curve2}_{flood_type}_damage_value_max": damage_values_2[1],
-            f"{curve2}_{flood_type}_damage_value_mean": damage_values_2[2],
+            f"{curve1}_{flood_type}_damage_fraction": _to_float(damage_fraction1),
+            f"{curve2}_{flood_type}_damage_fraction": _to_float(damage_fraction2),
+            f"{curve1}_{flood_type}_damage_value_min": _to_float(damage_values_1[0]),
+            f"{curve1}_{flood_type}_damage_value_max": _to_float(damage_values_1[1]),
+            f"{curve1}_{flood_type}_damage_value_mean": _to_float(damage_values_1[2]),
+            f"{curve2}_{flood_type}_damage_value_min": _to_float(damage_values_2[0]),
+            f"{curve2}_{flood_type}_damage_value_max": _to_float(damage_values_2[1]),
+            f"{curve2}_{flood_type}_damage_value_mean": _to_float(damage_values_2[2]),
         }
 
     # Apply calculation for each flood type
@@ -330,9 +339,9 @@ def calculate_damage(
         flood_results_df = pd.DataFrame(
             list(flood_results)
         )  # Convert results to DataFrame
-        disrupted_links.update(
-            flood_results_df
-        )  # Update disrupted_links with the calculated values
+        # Assign columns explicitly (more robust with newer pandas dtypes)
+        for col in flood_results_df.columns:
+            disrupted_links[col] = flood_results_df[col]
 
     return disrupted_links
 
@@ -395,8 +404,29 @@ def format_intersections(
     # Reverse map numeric damage levels back to strings
     for col in ["damage_level_surface", "damage_level_river"]:
         intersections_gp[col] = intersections_gp[col].map(damage_level_dict_reverse)
+    # Build a robust attributes frame from road links (supports FAF5 + UK subnetwork)
+    rl = road_links.copy()
+    if "road_label" not in rl.columns:
+        if "road_bridge" in rl.columns:
+            rl["road_label"] = (
+                rl["road_bridge"].astype(str).str.lower().replace({"yes": "bridge", "no": "road"})
+            )
+        else:
+            rl["road_label"] = "road"
+
+    if "form_of_way" not in rl.columns:
+        rl["form_of_way"] = "Single Carriageway"
+    if "trunk_road" not in rl.columns:
+        rl["trunk_road"] = False
+    if "urban" not in rl.columns:
+        rl["urban"] = 0
+    if "lanes" not in rl.columns:
+        rl["lanes"] = 2
+    if "averageWidth" not in rl.columns:
+        rl["averageWidth"] = 3.65
+
     intersections_gp = intersections_gp.merge(
-        road_links[
+        rl[
             [
                 "e_id",
                 "road_classification",
@@ -411,6 +441,17 @@ def format_intersections(
         on="e_id",
         how="left",
     )
+
+    # Final normalization to avoid invalid labels during damage calculation
+    intersections_gp["road_label"] = (
+        intersections_gp["road_label"].astype(str).str.lower().replace({"nan": "road", "": "road"})
+    )
+    intersections_gp.loc[
+        ~intersections_gp["road_label"].isin(["road", "bridge", "tunnel"]), "road_label"
+    ] = "road"
+    intersections_gp["form_of_way"] = intersections_gp["form_of_way"].fillna("Single Carriageway")
+    intersections_gp["trunk_road"] = intersections_gp["trunk_road"].fillna(False)
+
     return intersections_gp
 
 
@@ -448,10 +489,15 @@ def main():
     )
     damage_curves = create_damage_curves(damages_ratio_df)
 
-    # damage values (updated with UK values)
-    road_links = gpd.read_parquet(
-        base_path / "networks" / "GB_road_links_with_bridges.gpq"
+    # road links: prefer FAF5 for USA runs, fallback to UK subnetwork
+    faf5_links_path = base_path / "networks" / "faf5" / "faf5_road_links.gpq"
+    gb_subnetwork_path = (
+        base_path / "networks" / "test_subnetwork" / "GB_road_links_with_bridges_subnetwork.gpq"
     )
+    if faf5_links_path.exists():
+        road_links = gpd.read_parquet(faf5_links_path)
+    else:
+        road_links = gpd.read_parquet(gb_subnetwork_path)
     road_damage_file = pd.read_excel(
         base_path / "asset_costs" / "damage_cost_road_flood_uk.xlsx", sheet_name="roads"
     )

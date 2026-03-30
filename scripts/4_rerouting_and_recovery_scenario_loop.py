@@ -98,7 +98,7 @@ def main(
     ) = load_scenarios(base_path)
 
     # Load pre-identified odpfc (containing flooded links)
-    disrupted_candidates = pd.read_parquet(
+    odpfc_path = (
         base_path.parent
         / "results"
         / "disruption_analysis"
@@ -106,6 +106,21 @@ def main(
         / "od"
         / f"odpfc_{depth_key}_{flood_key}.pq"
     )
+    if not odpfc_path.exists():
+        logging.warning(
+            f"Missing odpfc at {odpfc_path}. Falling back to base scenario odpfc."
+        )
+        base_odpfc_path = (
+            base_path.parent / "results" / "base_scenario" / "revision" / "odpfc.pq"
+        )
+        if base_odpfc_path.exists():
+            odpfc_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.read_parquet(base_odpfc_path).to_parquet(odpfc_path)
+        else:
+            logging.error(f"Base scenario odpfc missing: {base_odpfc_path}")
+            sys.exit(1)
+
+    disrupted_candidates = pd.read_parquet(odpfc_path)
     disrupted_candidates["od_id"] = disrupted_candidates.index  # numbering od pairs
     # Load road links with damage (e.g., flood depth and damage level)
     road_links = gpd.read_parquet(
@@ -117,13 +132,42 @@ def main(
         / "links"
         / f"road_links_{flood_key}.gpq"
     )
+    # FAF data does not include road_label; create a default
+    if "road_label" not in road_links.columns:
+        road_links["road_label"] = "road"
+        if "road_bridge" in road_links.columns:
+            road_links.loc[road_links["road_bridge"].astype(str).str.lower() == "yes", "road_label"] = "bridge"
     road_links["breakpoint_flows"] = road_links["combined_label"].map(
         flow_breakpoint_dict
     )
     initial_road_links_cols = road_links.columns
 
+    # Build flood_links if missing (FAF pipeline uses base scenario odpfc)
+    if "flood_links" not in disrupted_candidates.columns:
+        if "path" not in disrupted_candidates.columns:
+            logging.error("odpfc is missing 'path' column; cannot derive flood_links.")
+            sys.exit(1)
+        flooded_edges = set(
+            road_links.loc[road_links["damage_level_max"] != "no", "e_id"]
+        )
+        disrupted_candidates["flood_links"] = disrupted_candidates["path"].apply(
+            lambda p: [e for e in (list(p) if p is not None else []) if e in flooded_edges]
+        )
+        disrupted_candidates = disrupted_candidates[
+            disrupted_candidates["flood_links"].map(len) > 0
+        ].reset_index(drop=True)
+
     # Recovery analysis loop
     cDict = {}
+    out_path = (
+        base_path.parent
+        / "results"
+        / "rerouting_analysis"
+        / "revision"
+        / str(depth_key)
+        / str(flood_key)
+    )
+    out_path.mkdir(parents=True, exist_ok=True)
     # Load link recovery scenarios (both capacity and speed)
     for scenario_idx in range(len(scenarios)):
         logging.info(f"Rerouting Analysis on Scenario-{scenario_idx} of recovery...")
@@ -327,15 +371,6 @@ def main(
         )
 
         logging.info("Saving results to disk...")
-        out_path = (
-            base_path.parent
-            / "results"
-            / "rerouting_analysis"
-            / "revision"
-            / str(depth_key)
-            / str(flood_key)
-        )
-        out_path.mkdir(parents=True, exist_ok=True)
 
         # rerouting costs
         cDict[scenario_idx] = [rer_time, rer_operate, rer_toll, rerouting_cost]
@@ -381,6 +416,9 @@ def main(
         gc.collect()
 
     logging.info("Saving overall rerouting costs to disk...")
+    if len(cDict) == 0:
+        logging.info("No rerouting results to save.")
+        return
     cost_df = pd.DataFrame.from_dict(
         cDict,
         orient="index",

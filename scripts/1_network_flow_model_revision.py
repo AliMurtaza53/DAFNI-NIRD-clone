@@ -4,6 +4,7 @@ import time
 
 import pandas as pd
 import geopandas as gpd  # type: ignore
+import duckdb
 
 from nird.utils import load_config
 import nird.road_revised as func
@@ -28,10 +29,10 @@ def main(
         - Model parameters:
             - Flow breakpoints, capacity, free-flow speeds, minimum speeds,
             and urban speed limits.
-        - GB_road_links_with_bridges.gpq:
-            GeoDataFrame containing road network data with attributes.
-        - od_gb_oa_2021_node_with_bridges.csv:
-            Origin-destination matrix containing traffic flow data.
+        - faf5_road_links.gpq:
+            GeoDataFrame containing FAF5 road network data with attributes.
+        - faf5_od_matrix.pq:
+            Origin-destination matrix containing FAF5 traffic flow data.
 
     Model Outputs:
         - edge_flows_validation.gpq:
@@ -65,15 +66,14 @@ def main(
         urban_speed_dict = json.load(f)
     logging.info(flow_capacity_dict)
 
-    # network links -> network links with bridges
+    # network links -> network links with bridges (SUBNETWORK)
     road_link_file = gpd.read_parquet(
-        base_path / "networks" / "GB_road_links_with_bridges.gpq"
+        base_path / "networks" / "faf5" / "faf5_road_links.gpq"
     )
-    # od matrix (2021) -> updated to od with bridges
+    # od matrix (2021)
     od_node_2021 = pd.read_parquet(
-        base_path / "census_datasets" / "od_gb_oa_2021_node_with_bridges.pq"
+        base_path / "census_datasets" / "faf5_od_matrix.pq"
     )
-    od_node_2021["Car21"] = od_node_2021["Car21"] * 2
 
     if sample_stride > 1:
         logging.info(f"For testing, sampling every {sample_stride} flows")
@@ -95,14 +95,12 @@ def main(
     )
     # create igraph network
     logging.info("Create igraph network")
-    network, road_links = func.create_igraph_network(road_links)
+    network, road_links = func.create_igraph_network(road_links, vehicle_type="car")
     # run flow simulation
     logging.info("Run simulation")
     (
         road_links,
-        isolation,
-        odpfc,
-        _,
+        cList,
     ) = func.network_flow_model(
         road_links,
         network,
@@ -112,6 +110,13 @@ def main(
         num_of_cpu,
         db_path,
     )
+    
+    # Read isolation and odpfc from database
+    conn = duckdb.connect(db_path)
+    isolation = conn.execute("SELECT * FROM isolated_od").fetchall()
+    odpfc = conn.execute("SELECT * FROM odpfc").fetchall()
+    conn.close()
+    
     # isolation
     isolation_df = pd.DataFrame(
         isolation,
@@ -137,6 +142,7 @@ def main(
             "operating_cost_per_flow",
             "time_cost_per_flow",
             "toll_cost_per_flow",
+            "fare_cost_per_flow",
         ],
     )
     odpfc_df.path = odpfc_df.path.apply(tuple)

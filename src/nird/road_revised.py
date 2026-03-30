@@ -240,17 +240,17 @@ def compute_costs_for_links(
         # safe speed
         v_kmph = distance_km / np.maximum(time_hr, eps)
 
-        # operate_cost per km vectorised (use values from cons)
+        # operate_cost per mile vectorised (use values from cons)
         a, b, c, d = tuple(cons.FUEL_LITRE_PER_KM[vehicle_type].values())
         L = a / np.maximum(v_kmph, eps) + b + c * v_kmph + d * v_kmph**2
-        FC = L * 1.4  # GBP per km
+        FC = L * 1.4 * cons.GBP_TO_USD  # USD per litre
 
         a1, b1 = tuple(cons.NON_FUEL_PENCE_PER_KM[vehicle_type].values())
-        NFC = a1 + b1 / np.maximum(v_kmph, eps)  # pence per km
-        NFC = NFC / 100.0  # GBP per km
+        NFC = a1 + b1 / np.maximum(v_kmph, eps)  # cents USD per mile
+        NFC = NFC / 100.0  # USD per mile
 
-        operate_cost_per_km = FC + NFC
-        operate_cost = operate_cost_per_km * distance_km  # GBP (vector)
+        operate_cost_per_mile = FC + NFC
+        operate_cost = operate_cost_per_mile * distance_km  # USD (vector)
 
         # value of time: allow dict or function
         if hasattr(cons, "VOT_POUND_PER_HOUR"):
@@ -334,15 +334,35 @@ def compute_costs_for_links(
 def edge_reclassification_func(
     road_links: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Reclassify network edges to "M, A_dual, A_single, B"."""
+    """Reclassify network edges to "M, A_dual, A_single, B."""
+    if "road_classification" not in road_links.columns:
+        raise ValueError("road_classification column not exists!")
+
+    rc_lower = road_links["road_classification"].astype(str).str.lower().fillna("")
     road_links["combined_label"] = "A_dual"
+
+    # FAF/OSM-style classifications
+    road_links.loc[
+        rc_lower.isin(["motorway", "motorway_link"]), "combined_label"
+    ] = "M"
+    road_links.loc[
+        rc_lower.isin(["trunk", "primary", "secondary"]), "combined_label"
+    ] = "A_dual"
+    road_links.loc[rc_lower.isin(["tertiary"]), "combined_label"] = "A_single"
+    road_links.loc[
+        rc_lower.isin(["service", "unclassified"]), "combined_label"
+    ] = "B"
+
+    # UK-style classifications (override where applicable)
     road_links.loc[road_links.road_classification == "Motorway", "combined_label"] = "M"
     road_links.loc[road_links.road_classification == "B Road", "combined_label"] = "B"
-    road_links.loc[
-        (road_links.road_classification == "A Road")
-        & (road_links.form_of_way == "Single Carriageway"),
-        "combined_label",
-    ] = "A_single"
+    if "form_of_way" in road_links.columns:
+        road_links.loc[
+            (road_links.road_classification == "A Road")
+            & (road_links.form_of_way == "Single Carriageway"),
+            "combined_label",
+        ] = "A_single"
+
     return road_links
 
 
@@ -468,6 +488,10 @@ def edge_init(
         road_links["combined_label"].map(capacity_plph_dict) * road_links["lanes"] * 24
     )
     road_links["acc_speed"] = road_links["initial_flow_speeds"]
+    # current state mirrors initial state
+    road_links["current_capacity"] = road_links["acc_capacity"]
+    road_links["current_speed"] = road_links["acc_speed"]
+    road_links["current_flow"] = road_links["acc_flow"]
 
     # remove invalid road links
     road_links = road_links[road_links.acc_capacity > 0.5].reset_index(drop=True)

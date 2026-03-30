@@ -106,7 +106,7 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Dict[str, str]]:
         # config_path = "config.json"
 
         config_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", "config.json"
+            os.path.dirname(__file__), "..", "..", "config.json"
         )
 
     with open(config_path, "r") as config_fh:

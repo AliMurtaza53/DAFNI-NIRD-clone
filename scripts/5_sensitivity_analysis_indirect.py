@@ -11,6 +11,7 @@ Y: indirect rerouting cost
 
 # %%
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -27,8 +28,11 @@ import gc
 import warnings
 
 warnings.simplefilter("ignore")
-base_path = Path(load_config()["paths"]["base_path"])  # local/processed_data
-res_path = Path(load_config()["paths"]["output_path"])  # local/outputs
+paths = load_config()["paths"]
+base_path = Path(paths.get("base_path", paths.get("soge_clusters", "")))
+if not base_path:
+    raise KeyError("Missing base_path or soge_clusters in config.json paths.")
+res_path = Path(paths.get("output_path", base_path.parent / "results"))
 
 # %%
 CONV_METER_TO_MILE = 0.000621371
@@ -91,6 +95,11 @@ cols = [
 ]
 edges = pd.DataFrame()
 path = res_path / "rerouting_analysis" / "revision"
+if not path.exists():
+    print(
+        f"Rerouting analysis outputs not found at {path}. Run script 4 first. Skipping."
+    )
+    sys.exit(0)
 
 # %%
 for depth_key in [15, 30, 60]:

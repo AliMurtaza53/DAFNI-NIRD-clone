@@ -103,12 +103,91 @@ def extract_node_connectivity(faf5_links, link_id_col='ID', faf5_nodes=None):
     to_ids = []
     
     for geom in faf5_links.geometry:
-        coords = list(geom.coords)
-        from_ids.append(get_or_create_node(coords[0]))
-        to_ids.append(get_or_create_node(coords[-1]))
+        # Handle both LineString and MultiLineString
+        if geom.geom_type == 'MultiLineString':
+            # For MultiLineString, use first and last coordinates from all parts
+            coords = []
+            for line in geom.geoms:
+                coords.extend(list(line.coords))
+        else:
+            coords = list(geom.coords)
+        
+        if len(coords) > 0:
+            from_ids.append(get_or_create_node(coords[0]))
+            to_ids.append(get_or_create_node(coords[-1]))
     
     print(f"  Created {len(nodes)} unique nodes from geometry")
     return from_ids, to_ids, nodes
+
+
+def filter_by_states(faf5_links, states):
+    """
+    Filter links to specific state(s).
+    
+    Args:
+        faf5_links: GeoDataFrame with FAF5 link data
+        states: String (single state) or list of state abbreviations (e.g., 'VA' or ['VA', 'MD', 'DC'])
+    
+    Returns:
+        Filtered GeoDataFrame with only links in specified states
+    """
+    if states is None:
+        return faf5_links
+    
+    original_count = len(faf5_links)
+    
+    if 'STATE' not in faf5_links.columns:
+        print("  Warning: 'STATE' column not found, cannot filter by state")
+        return faf5_links
+    
+    # Convert single state to list
+    if isinstance(states, str):
+        states = [states]
+    
+    # Filter to specified states
+    filtered = faf5_links[faf5_links['STATE'].isin(states)].copy()
+    removed = original_count - len(filtered)
+    
+    print(f"\nFiltering to state(s): {', '.join(states)}")
+    print(f"  Kept {len(filtered)} links in specified state(s)")
+    print(f"  Removed {removed} links in other states")
+    
+    return filtered
+
+
+def filter_by_geography(faf5_links, boundary_gdf):
+    """
+    Clip links to a user-defined geographic boundary.
+    
+    Args:
+        faf5_links: GeoDataFrame with FAF5 link data
+        boundary_gdf: GeoDataFrame with polygon boundary to clip to
+    
+    Returns:
+        Filtered GeoDataFrame with only links intersecting the boundary
+    """
+    if boundary_gdf is None:
+        return faf5_links
+    
+    original_count = len(faf5_links)
+    
+    # Ensure same CRS
+    if faf5_links.crs != boundary_gdf.crs:
+        print(f"  Reprojecting boundary from {boundary_gdf.crs} to {faf5_links.crs}")
+        boundary_gdf = boundary_gdf.to_crs(faf5_links.crs)
+    
+    # Get union of all boundary polygons
+    boundary_union = boundary_gdf.unary_union
+    
+    # Spatial filter - keep links that intersect boundary
+    filtered = faf5_links[faf5_links.intersects(boundary_union)].copy()
+    removed = original_count - len(filtered)
+    
+    print(f"\nClipping to user-defined geography:")
+    print(f"  Kept {len(filtered)} links intersecting boundary")
+    print(f"  Removed {removed} links outside boundary")
+    
+    return filtered
 
 
 def filter_centroid_connectors(faf5_links):
@@ -142,7 +221,8 @@ def filter_centroid_connectors(faf5_links):
         return faf5_links
 
 
-def convert_faf5_links_to_nird(faf5_links, target_crs='EPSG:2163', filter_centroids=True):
+def convert_faf5_links_to_nird(faf5_links, target_crs='EPSG:2163', filter_centroids=True, 
+                                states=None, boundary_gdf=None):
     """
     Convert FAF5 link GeoDataFrame to NIRD format.
     
@@ -151,11 +231,20 @@ def convert_faf5_links_to_nird(faf5_links, target_crs='EPSG:2163', filter_centro
         target_crs: Target coordinate reference system (default: US Albers Equal Area)
                    Use 'EPSG:27700' for UK, 'EPSG:2163' for continental US
         filter_centroids: If True, remove Class==50 centroid connector links
+        states: Optional string or list of state abbreviations to filter to (e.g., 'VA' or ['VA', 'MD'])
+        boundary_gdf: Optional GeoDataFrame with polygon boundary to clip to
     
     Returns:
         GeoDataFrame in NIRD format
     """
-    # Filter centroid connectors first
+    # Apply geographic filters first
+    if states is not None:
+        faf5_links = filter_by_states(faf5_links, states)
+    
+    if boundary_gdf is not None:
+        faf5_links = filter_by_geography(faf5_links, boundary_gdf)
+    
+    # Filter centroid connectors
     if filter_centroids:
         faf5_links = filter_centroid_connectors(faf5_links)
     
@@ -293,9 +382,13 @@ def main():
     """Main conversion workflow."""
     
     # Configuration
-    FAF5_GDB_PATH = r"C:\Path\To\FAF5_network.gdb"  # UPDATE THIS PATH
+    FAF5_GDB_PATH = r"C:\Users\alimu\Desktop\Github\FAF5_Model_Highway_Network\Networks\Geodatabase Format\FAF5Network.gdb"
     OUTPUT_DIR = Path(r"C:\Users\alimu\NIRD_Data\soge_clusters\networks\faf5")
     TARGET_CRS = 'EPSG:2163'  # US Albers Equal Area projection
+    
+    # Geographic filtering options (optional)
+    FILTER_STATES = None  # e.g., 'VA' or ['VA', 'MD', 'DC'] or None for all states
+    BOUNDARY_FILE = None  # e.g., r"C:\Path\To\study_area.shp" or None for no clipping
     
     # Create output directory
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -308,8 +401,8 @@ def main():
     layers = list_gdb_layers(FAF5_GDB_PATH)
     
     # Step 2: Read FAF5 links (adjust layer name as needed)
-    link_layer = "Highway_Network_Link"  # Common FAF5 layer name
-    node_layer = "Highway_Network_Node"  # Node layer
+    link_layer = "FAF5_Links"  # FAF5 layer name
+    node_layer = "FAF5_Nodes"  # Node layer
     
     print(f"\nReading layer: {link_layer}")
     faf5_links = gpd.read_file(FAF5_GDB_PATH, layer=link_layer)
@@ -340,23 +433,65 @@ def main():
         print(f"  Warning: Could not read nodes layer: {e}")
         faf5_nodes = None
     
-    # Step 3: Convert to NIRD format
-    nird_links = convert_faf5_links_to_nird(faf5_links, target_crs=TARGET_CRS)
+    # Step 3: Load optional boundary for clipping
+    boundary_gdf = None
+    if BOUNDARY_FILE is not None:
+        print(f"\nLoading boundary file: {BOUNDARY_FILE}")
+        boundary_gdf = gpd.read_file(BOUNDARY_FILE)
+        print(f"  Loaded boundary with {len(boundary_gdf)} polygon(s)")
+        print(f"  Boundary CRS: {boundary_gdf.crs}")
     
-    # Step 4: Validate
+    # Step 4: Convert to NIRD format (with optional filters)
+    nird_links = convert_faf5_links_to_nird(
+        faf5_links, 
+        target_crs=TARGET_CRS,
+        states=FILTER_STATES,
+        boundary_gdf=boundary_gdf
+    )
+    
+    # Step 5: Validate
     validate_nird_network(nird_links)
     
-    # Step 5: Save to GeoParquet
-    output_path = OUTPUT_DIR / "faf5_road_links.gpq"
+    # Step 6: Save to GeoParquet
+    # Create descriptive filename based on filters
+    if FILTER_STATES is not None:
+        states_str = '_'.join(FILTER_STATES) if isinstance(FILTER_STATES, list) else FILTER_STATES
+        output_filename = f"faf5_road_links_{states_str}.gpq"
+    elif BOUNDARY_FILE is not None:
+        output_filename = "faf5_road_links_clipped.gpq"
+    else:
+        output_filename = "faf5_road_links.gpq"
+    
+    output_path = OUTPUT_DIR / output_filename
     print(f"\nSaving to: {output_path}")
     nird_links.to_parquet(output_path)
     print(f"✓ Saved {len(nird_links)} links")
     
     # Optional: Save nodes as well
-    # Extract nodes dictionary from the conversion
-    _, _, nodes = extract_node_connectivity(faf5_links)
-    nodes_gdf = create_node_geodataframe(nodes, crs=TARGET_CRS)
-    nodes_output_path = OUTPUT_DIR / "faf5_road_nodes.gpq"
+    # Note: Extract from original links to get correct connectivity
+    # (after filtering, some nodes may be disconnected)
+    nodes_output_filename = output_filename.replace('_links', '_nodes')
+    nodes_output_path = OUTPUT_DIR / nodes_output_filename
+    
+    # Create nodes from the filtered network
+    from shapely.geometry import Point
+    node_coords = set()
+    for geom in nird_links.geometry:
+        # Handle both LineString and MultiLineString
+        if geom.geom_type == 'MultiLineString':
+            for line in geom.geoms:
+                coords = list(line.coords)
+                if len(coords) > 0:
+                    node_coords.add((round(coords[0][0], 6), round(coords[0][1], 6)))
+                    node_coords.add((round(coords[-1][0], 6), round(coords[-1][1], 6)))
+        else:
+            coords = list(geom.coords)
+            if len(coords) > 0:
+                node_coords.add((round(coords[0][0], 6), round(coords[0][1], 6)))
+                node_coords.add((round(coords[-1][0], 6), round(coords[-1][1], 6)))
+    
+    nodes_data = [{'node_id': i, 'geometry': Point(x, y)} for i, (x, y) in enumerate(node_coords)]
+    nodes_gdf = gpd.GeoDataFrame(nodes_data, crs=TARGET_CRS)
     nodes_gdf.to_parquet(nodes_output_path)
     print(f"✓ Saved {len(nodes_gdf)} nodes to: {nodes_output_path}")
     
