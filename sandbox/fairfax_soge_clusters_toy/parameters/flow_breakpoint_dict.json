@@ -1,0 +1,15 @@
+{
+    "_comment": "This file contains the flow breakpoint values for each OSM highway type. The flow breakpoint values are used to determine the flow of traffic on each highway type, which is then used to calculate the travel time on each edge in the graph.",
+    "M": 1200,
+    "A_dual": 1080,
+    "A_single": 1200,
+    "B": 1200,
+    "motorway": 1200,
+    "motorway_link": 1200,
+    "trunk": 1080,
+    "primary": 1080,
+    "secondary": 1080,
+    "tertiary": 1200,
+    "service": 1200,
+    "unclassified": 1200
+}

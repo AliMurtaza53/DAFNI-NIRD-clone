@@ -26,9 +26,18 @@ import matplotlib.pyplot as plt
 import warnings
 
 warnings.simplefilter("ignore")
-        # Use soge_clusters path instead of base_path
-base_path = Path(load_config()["paths"]["soge_clusters"])  
-res_path = base_path / "results"  # Results directory
+# Use soge_clusters path and keep outputs aligned with scripts 1-4
+base_path = Path(load_config()["paths"]["soge_clusters"])
+res_path = base_path.parent / "results"
+
+
+def first_existing(paths):
+    """Return first existing path from a sequence, else None."""
+    for path in paths:
+        p = Path(path)
+        if p.exists():
+            return p
+    return None
 
 
 # %%
@@ -40,7 +49,7 @@ def normalised(df):
     return Result
 
 
-def preprocess(intersections, road_links, lad_shp):
+def preprocess(intersections, road_links, lad_shp=None):
     # add geometry to intersections
     joined = intersections.copy()
     # intersections = intersections.copy()
@@ -199,9 +208,13 @@ def preprocess(intersections, road_links, lad_shp):
 # %%
 # Load datasets (SUBNETWORK - note: uses base_path which is different from other scripts)
 path = res_path / "damage_analysis" / "revision"
-# Using subnetwork files
-road_links_path = (
-    base_path / "networks" / "test_subnetwork" / "GB_road_links_with_bridges_subnetwork.gpq"
+# Prefer toy/FAF5 links, fallback to UK subnetwork
+road_links_path = first_existing(
+    [
+        base_path / "inputs" / "networks" / "faf5" / "faf5_road_links.gpq",
+        base_path / "networks" / "faf5" / "faf5_road_links.gpq",
+        base_path / "networks" / "test_subnetwork" / "GB_road_links_with_bridges_subnetwork.gpq",
+    ]
 )
 lad_path = (
     base_path
@@ -210,35 +223,46 @@ lad_path = (
     / "gb_lad_2021_estimates.geoparquet"
 )
 
-if not road_links_path.exists() or not lad_path.exists():
+if road_links_path is None or not road_links_path.exists():
     print(
-        "Direct sensitivity analysis is UK-specific and required files are missing. "
-        f"road_links: {road_links_path.exists()}, lad: {lad_path.exists()}. Skipping."
+        "Direct sensitivity analysis skipped: road links file not found in toy/FAF5/UK paths."
     )
     sys.exit(0)
 
 road_links = gpd.read_parquet(road_links_path)
-lad_shp = gpd.read_parquet(lad_path)
+lad_shp = gpd.read_parquet(lad_path) if lad_path.exists() else None
 
 intersections = pd.DataFrame()
 for root, dirs, files in os.walk(path):
     for file in files:
-        if file.startswith(
-            "intersections"
-        ):  # Load all intersections files from 17 historical flood events
+        if file.endswith("_with_damage_values.csv") or file.startswith("intersections"):
             temp = pd.read_csv(os.path.join(root, file))
             intersections = pd.concat([intersections, temp], axis=0, ignore_index=True)
+
+if intersections.empty:
+    print(f"No damage-analysis CSVs found under {path}. Run script 3 first. Skipping.")
+    sys.exit(0)
 
 Xs = preprocess(intersections, road_links, lad_shp)
 # %%
 # temp_Xs = Xs.copy()
 # remove damage level
 temp_Xs = Xs[Xs.damage_level == "severe"].reset_index(drop=True)  #!!! update
+if temp_Xs.empty:
+    temp_Xs = Xs.copy().reset_index(drop=True)
 # convert string objects to numeric values for sensitivity analysis
 road_classification_mapping = {
     "B Road": 0,
     "A Road": 2,
     "Motorway": 1,
+    "motorway": 1,
+    "motorway_link": 1,
+    "trunk": 2,
+    "primary": 2,
+    "secondary": 0,
+    "tertiary": 0,
+    "service": 0,
+    "unclassified": 0,
 }
 form_of_way_mapping = {
     "Single Carriageway": 0,

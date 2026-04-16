@@ -48,7 +48,7 @@ def voc_func(
     lpkm = 0.178 - 0.00299 * s + 0.0000205 * (s**2)  # fuel consumption (liter/km)
     voc_per_km = 140 * lpkm * PENCE_TO_POUND  # average petrol cost: 140 pence/liter
 
-    return voc_per_km  # £/km
+    return voc_per_km  # $/km
 
 
 def cost_func(
@@ -59,12 +59,12 @@ def cost_func(
         return np.nan
     time = distance * CONV_METER_TO_MILE / speed  # hour
     ave_occ = 1.06
-    vot = 17.69  # £/hour
-    voc_per_km = voc_func(speed)  # £/km
-    c_time = time * ave_occ * vot  # £
-    c_fuel = distance * CONV_METER_TO_MILE * CONV_MILE_TO_KM * voc_per_km  # £
+    vot = 22.46  # $/hour (17.69 GBP/hour * 1.27 conversion)
+    voc_per_km = voc_func(speed)  # $/km
+    c_time = time * ave_occ * vot  # $
+    c_fuel = distance * CONV_METER_TO_MILE * CONV_MILE_TO_KM * voc_per_km  # $
 
-    return c_time + c_fuel  # total cost per trip in £
+    return c_time + c_fuel  # total cost per trip in $
 
 
 def normalised(df):

@@ -3,21 +3,80 @@ import os
 from typing import Dict, Optional
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 from collections import defaultdict
 import rasterio
 
-from snail import io, intersection
-from nird.utils import load_config
+from snail import intersection
+from nird.utils import get_results_variant, load_config
 import warnings
 import logging
+import pyproj
 
 warnings.filterwarnings("ignore")
 
 base_path = Path(load_config()["paths"]["soge_clusters"])
 raster_path = base_path / "hazards" / "completed"
 TARGET_CRS = "EPSG:2163"  # US National Atlas Equal Area (use for USA networks)
+
+
+def configure_proj_runtime() -> Optional[Path]:
+    """Ensure PROJ can find proj.db for CRS transforms (Rasterio/GDAL/PROJ)."""
+    candidate_dirs = []
+
+    # Prefer environment-local data first (avoid stale external PROJ_LIB overrides)
+    candidate_dirs.append(Path(rasterio.__file__).resolve().parent / "proj_data")
+
+    try:
+        proj_data_dir = pyproj.datadir.get_data_dir()
+        if proj_data_dir:
+            candidate_dirs.append(Path(proj_data_dir))
+    except Exception:
+        pass
+
+    # Consider explicit env vars after local defaults
+    for key in ("PROJ_DATA", "PROJ_LIB"):
+        val = os.environ.get(key)
+        if val:
+            candidate_dirs.append(Path(val))
+
+    for cdir in candidate_dirs:
+        try:
+            if cdir.exists() and (cdir / "proj.db").exists():
+                # Set both for compatibility across PROJ versions / GDAL builds
+                os.environ["PROJ_DATA"] = str(cdir)
+                os.environ["PROJ_LIB"] = str(cdir)
+                try:
+                    pyproj.datadir.set_data_dir(str(cdir))
+                except Exception:
+                    pass
+                logging.info(f"Using PROJ data directory: {cdir}")
+                return cdir
+        except Exception:
+            continue
+
+    logging.warning(
+        "Could not locate proj.db. Set PROJ_DATA (or PROJ_LIB) to a directory containing proj.db."
+    )
+    return None
+
+
+configure_proj_runtime()
+
+
+def first_existing(paths):
+    """Return first existing path from a sequence, else None."""
+    for path in paths:
+        p = Path(path)
+        if p.exists():
+            return p
+    return None
 
 
 def validate_output(path: Path, gdf: gpd.GeoDataFrame, label: str) -> None:
@@ -53,23 +112,26 @@ def log_summary(label: str, gdf: gpd.GeoDataFrame) -> None:
         logging.info(f"{label} damage_level_max counts: {counts.to_dict()}")
 
 
-def load_usa_boundary() -> gpd.GeoDataFrame:
-    """Load a USA boundary polygon from hardcoded bounding boxes."""
+def load_analysis_boundary(base_path: Path) -> gpd.GeoDataFrame:
+    """Load study-area boundary (preferred) or fallback to a broad USA polygon."""
+    study_area_path = first_existing(
+        [
+            base_path / "study_area" / "fairfax_study_area.gpkg",
+            base_path / "study_area" / "fairfax_study_area.geojson",
+            base_path / "inputs" / "study_area" / "fairfax_study_area.gpkg",
+            base_path / "inputs" / "study_area" / "fairfax_study_area.geojson",
+        ]
+    )
+    if study_area_path is not None:
+        return gpd.read_file(study_area_path)
+
     from shapely.geometry import box
-    
-    # Continental US, Alaska, and Hawaii bounding boxes
+
     continental = box(-125, 24, -66, 50)
     alaska = box(-170, 50, -130, 72)
     hawaii = box(-160, 18, -154, 23)
-    
-    # Merge all regions
     usa_geom = continental.union(alaska).union(hawaii)
-    usa = gpd.GeoDataFrame(
-        {"name": ["USA"]}, 
-        geometry=[usa_geom],
-        crs="EPSG:4326"
-    )
-    return usa
+    return gpd.GeoDataFrame({"name": ["USA"]}, geometry=[usa_geom], crs="EPSG:4326")
 
 
 def intersect_features_with_raster(
@@ -96,14 +158,61 @@ def intersect_features_with_raster(
 
     logging.info(f"Intersecting features with raster {raster_key}...")
 
-    # run the intersection analysis using a windowed raster read
-    prepared = intersection.prepare_linestrings(features)
+    # Keep only columns needed downstream to reduce split/copy overhead substantially
+    required_cols = ["e_id", "road_classification", "trunk_road", "road_label", "geometry"]
+    present_cols = [c for c in required_cols if c in features.columns]
+    features_min = features[present_cols].copy()
 
-    with rasterio.open(raster_path) as dataset:
+    # Ensure expected optional columns exist for damage logic
+    if "trunk_road" not in features_min.columns:
+        features_min["trunk_road"] = None
+    if "road_label" not in features_min.columns:
+        features_min["road_label"] = None
+
+    # Avoid pandas extension/Arrow string dtypes that can interact badly with
+    # snail's row-wise splitting on large datasets.
+    for col in [c for c in features_min.columns if c != "geometry"]:
+        if str(features_min[col].dtype).startswith("string"):
+            features_min[col] = features_min[col].astype(object)
+
+    # run the intersection analysis using a windowed raster read
+    prepared = intersection.prepare_linestrings(features_min)
+
+    with rasterio.Env(
+        PROJ_DATA=os.environ.get("PROJ_DATA"),
+        PROJ_LIB=os.environ.get("PROJ_LIB"),
+        GTIFF_SRS_SOURCE="EPSG",
+    ):
+        dataset = rasterio.open(raster_path)
+
+    with dataset:
         grid_full = intersection.GridDefinition.from_rasterio_dataset(dataset)
+        grid_crs = grid_full.crs
         if prepared.crs != grid_full.crs:
             logging.info("Projecting Feature (clipped) CRS to Grid CRS...")
-            prepared = prepared.to_crs(grid_full.crs)
+            try:
+                prepared = prepared.to_crs(grid_full.crs)
+            except Exception as e:
+                # Some toy rasters use LOCAL_CS naming for US National Atlas Equal Area.
+                # If that happens, keep features in their CRS and align grid CRS to match.
+                grid_crs_text = "" if grid_full.crs is None else str(grid_full.crs)
+                if (
+                    prepared.crs is not None
+                    and "US National Atlas Equal Area" in grid_crs_text
+                    and str(prepared.crs).find("2163") != -1
+                ):
+                    logging.warning(
+                        "Raster CRS is LOCAL_CS alias of US National Atlas Equal Area; "
+                        "using feature CRS for grid alignment without reprojection."
+                    )
+                    grid_crs = prepared.crs
+                else:
+                    raise RuntimeError(
+                        "CRS transform to raster grid failed. "
+                        "Aborting to avoid invalid mixed-CRS intersections. "
+                        "Fix PROJ/CRS configuration first. "
+                        f"Details: {e}"
+                    )
 
         if prepared.empty:
             return prepared
@@ -129,7 +238,7 @@ def intersect_features_with_raster(
         raster = dataset.read(1, window=window)
         window_transform = dataset.window_transform(window)
         grid = intersection.GridDefinition(
-            crs=dataset.crs,
+            crs=grid_crs,
             width=int(window.width),
             height=int(window.height),
             transform=tuple(window_transform)[:6],
@@ -142,7 +251,14 @@ def intersect_features_with_raster(
     )
 
     # reproject back
-    intersections = intersections.to_crs(TARGET_CRS)
+    try:
+        intersections = intersections.to_crs(TARGET_CRS)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to reproject intersections to {TARGET_CRS}. "
+            "Aborting to avoid CRS ambiguity in downstream damage calculations. "
+            f"Details: {e}"
+        )
     intersections["length"] = intersections.geometry.length
 
     return intersections
@@ -558,9 +674,13 @@ def features_with_damage(
             "damage_level_max": "max",
         }
     )
-    intersections_gp["damage_level_max"] = intersections_gp.damage_level_max.astype(
-        int
-    ).map(damage_level_dict_reverse)
+    intersections_gp["damage_level_max"] = (
+        pd.to_numeric(intersections_gp["damage_level_max"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0)
+        .astype(int)
+        .map(damage_level_dict_reverse)
+    )
 
     features = features.merge(
         intersections_gp[["e_id", "flood_depth_max", "damage_level_max"]],
@@ -600,9 +720,16 @@ def main(depth_key, event_key):
     Returns:
         None: Outputs are saved to files.
     """
+    # Normalize event key so calls from CLI and direct Python are consistent
+    event_key = str(event_key).strip()
+
     # base scenario simulation results
     base_scenario_links = gpd.read_parquet(
-        base_path.parent / "results" / "base_scenario" / "revision" / "edge_flows.gpq"
+        base_path.parent
+        / "results"
+        / "base_scenario"
+        / get_results_variant()
+        / "edge_flows.gpq"
     )
     # Remove duplicate columns if they exist
     base_scenario_links = base_scenario_links.loc[:, ~base_scenario_links.columns.duplicated()]
@@ -636,73 +763,129 @@ def main(depth_key, event_key):
     }
     damage_level_dict_reverse = {i: k for k, i in damage_level_dict.items()}
 
-    # load USA boundary for clipping global rasters
-    usa_boundary = load_usa_boundary()
+    # load analysis boundary (DMV study area preferred)
+    analysis_boundary = load_analysis_boundary(base_path)
 
-    # flood event classification into surface/river flood
-    flood_types = ["surface", "river", "both"]
-    event_files = {flood_type: [] for flood_type in ["surface", "river"]}
-    # Iterate through flood types and process files
-    for flood_type in flood_types:
-        folder_path = raster_path / flood_type
-        if folder_path.exists():
-            for raster_dir in folder_path.rglob(
-                "Raster"
-            ):  # Search for "Raster" directories
-                for tif_file in raster_dir.rglob(
-                    "*.tif"
-                ):  # Find .tif files recursively
-                    # Filter files with "RD" in the name and exclude those with "IE"
-                    if "RD" in tif_file.name and "IE" not in tif_file.name:
-                        if flood_type == "both":
-                            if "FLSW" in tif_file.name:
-                                target_flood_type = "surface"
-                            elif "FLRF" in tif_file.name:
-                                target_flood_type = "river"
+    road_links_path = first_existing(
+        [
+            base_path / "networks" / "faf5" / "faf5_road_links.gpq",
+            base_path / "inputs" / "networks" / "faf5" / "faf5_road_links.gpq",
+        ]
+    )
+    if road_links_path is None:
+        raise FileNotFoundError(
+            "Could not find faf5_road_links.gpq in standard or toy input paths"
+        )
+
+    toy_hazard_dir = base_path / "inputs" / "test_17node"
+    toy_hazard_candidates = [
+        toy_hazard_dir / "fairfax_hazard_class50_17node_base.tif",
+        toy_hazard_dir / "fairfax_hazard_class50_17node_low.tif",
+        toy_hazard_dir / "fairfax_hazard_class50_17node_high.tif",
+        toy_hazard_dir / "fairfax_hazard_class50_17node.tif",
+    ]
+    toy_hazard_path = first_existing(toy_hazard_candidates)
+
+    if toy_hazard_path is not None:
+        toy_clip_path = first_existing(
+            [
+                base_path / "study_area" / "fairfax_study_area.gpkg",
+                base_path / "study_area" / "fairfax_study_area.geojson",
+            ]
+        )
+        if toy_clip_path is None:
+            raise FileNotFoundError(
+                "Could not find the Fairfax study-area boundary for toy raster clipping"
+            )
+
+        try:
+            event_key_num = int(event_key)
+        except (TypeError, ValueError):
+            event_key_num = 1
+
+        toy_variant = {1: "base", 2: "low", 3: "high"}.get(event_key_num, "base")
+        selected_tif = first_existing(
+            [toy_hazard_dir / f"fairfax_hazard_class50_17node_{toy_variant}.tif", toy_hazard_path]
+        )
+        logging.info(f"Toy hazard raster mode enabled with: {selected_tif}")
+
+        # In toy mode, use the same raster for both surface and river so the downstream
+        # damage analysis still sees both expected depth columns.
+        event_files = {
+            "surface": [str(selected_tif)],
+            "river": [str(selected_tif)],
+        }
+    else:
+        event_files = {flood_type: [] for flood_type in ["surface", "river"]}
+
+    # flood event classification into surface/river flood (non-toy mode only)
+    if toy_hazard_path is None:
+        flood_types = ["surface", "river", "both"]
+        event_files = {flood_type: [] for flood_type in ["surface", "river"]}
+        # Iterate through flood types and process files
+        for flood_type in flood_types:
+            folder_path = raster_path / flood_type
+            if folder_path.exists():
+                for raster_dir in folder_path.rglob(
+                    "Raster"
+                ):  # Search for "Raster" directories
+                    for tif_file in raster_dir.rglob(
+                        "*.tif"
+                    ):  # Find .tif files recursively
+                        # Filter files with "RD" in the name and exclude those with "IE"
+                        if "RD" in tif_file.name and "IE" not in tif_file.name:
+                            if flood_type == "both":
+                                if "FLSW" in tif_file.name:
+                                    target_flood_type = "surface"
+                                elif "FLRF" in tif_file.name:
+                                    target_flood_type = "river"
+                                else:
+                                    continue
                             else:
-                                continue
-                        else:
-                            target_flood_type = flood_type
+                                target_flood_type = flood_type
 
-                        # Append the file path to the appropriate flood_type list
-                        event_files[target_flood_type].append(str(tif_file))
+                            # Append the file path to the appropriate flood_type list
+                            event_files[target_flood_type].append(str(tif_file))
 
     event_dict = defaultdict(lambda: defaultdict(list))
-    for flood_type, list_of_events in event_files.items():
-        for event_path in list_of_events:
-            # Extract event from path structure
-            # Case 1: surface/EventName/Raster/file.tif → parts[-3]="EventName"
-            # Case 2: surface/Raster/file.tif → parts[-3]="surface" → extract from filename
-            path_parts = Path(event_path).parts
-            potential_event_folder = path_parts[-3] if len(path_parts) >= 3 else None
-            
-            if potential_event_folder not in ["surface", "river", "both", "Raster"]:
-                # It's a meaningful event folder name
-                event = potential_event_folder
-            else:
-                # Extract from filename - look for numeric identifiers (year, scenario code, etc.)
-                filename = Path(event_path).stem  # filename without extension
-                import re
+    if toy_hazard_path is not None:
+        event_dict[event_key] = defaultdict(list, event_files)
+    else:
+        for flood_type, list_of_events in event_files.items():
+            for event_path in list_of_events:
+                # Extract event from path structure
+                # Case 1: surface/EventName/Raster/file.tif → parts[-3]="EventName"
+                # Case 2: surface/Raster/file.tif → parts[-3]="surface" → extract from filename
+                path_parts = Path(event_path).parts
+                potential_event_folder = path_parts[-3] if len(path_parts) >= 3 else None
                 
-                # Find all numeric sequences in the filename
-                numbers = re.findall(r'\d+', filename)
-                event = None
-                
-                # Use first numeric sequence found (typically scenario/year)
-                if numbers:
-                    for num in numbers:
-                        # Prefer longer numeric sequences (more likely to be a year or meaningful ID)
-                        if len(num) >= 3:  # Changed from hardcoded year check
-                            event = num
-                            break
-                    if not event:
-                        event = numbers[0] if numbers else "default"
+                if potential_event_folder not in ["surface", "river", "both", "Raster"]:
+                    # It's a meaningful event folder name
+                    event = potential_event_folder
                 else:
-                    # Fallback: use first word-like part of filename
-                    event = filename.split("_")[0]
-            
-            if event:
-                event_dict[event][flood_type].append(event_path)
+                    # Extract from filename - look for numeric identifiers (year, scenario code, etc.)
+                    filename = Path(event_path).stem  # filename without extension
+                    import re
+                    
+                    # Find all numeric sequences in the filename
+                    numbers = re.findall(r'\d+', filename)
+                    event = None
+                    
+                    # Use first numeric sequence found (typically scenario/year)
+                    if numbers:
+                        for num in numbers:
+                            # Prefer longer numeric sequences (more likely to be a year or meaningful ID)
+                            if len(num) >= 3:  # Changed from hardcoded year check
+                                event = num
+                                break
+                        if not event:
+                            event = numbers[0] if numbers else "default"
+                    else:
+                        # Fallback: use first word-like part of filename
+                        event = filename.split("_")[0]
+                
+                if event:
+                    event_dict[event][flood_type].append(event_path)
 
     # analysis
     for flood_key, v in event_dict.items():
@@ -710,23 +893,19 @@ def main(depth_key, event_key):
             continue
         print(f"Starting intersection for event {flood_key}...")
         # load road links (SUBNETWORK)
-        road_links = gpd.read_parquet(
-            base_path / "networks" / "faf5" / "faf5_road_links.gpq"
-        )
+        road_links = gpd.read_parquet(road_links_path)
 
         # out path
         out_path = (
             base_path.parent
             / "results"
             / "disruption_analysis"
-            / "revision"
+            / get_results_variant()
             / str(depth_key)
         )
         
         # Load road links once outside the loop for efficiency
-        road_links_base = gpd.read_parquet(
-            base_path / "networks" / "faf5" / "faf5_road_links.gpq"
-        )
+        road_links_base = gpd.read_parquet(road_links_path)
 
         intersections = gpd.GeoDataFrame(
             columns=["e_id", "length", "index_i", "index_j"]
@@ -737,19 +916,22 @@ def main(depth_key, event_key):
             road_links_fresh = road_links_base.copy()
             
             for flood_path in flood_paths:
-                # clip path
-                clip_path = Path(
-                    flood_path.replace("Raster", "Vector").replace(".tif", ".shp")
-                )
-                clip_path1 = clip_path.with_name(clip_path.name.replace("_RD_", "_VE_"))
-                clip_path2 = clip_path.with_name(clip_path.name.replace("_RD_", "_PR_"))
-                if clip_path1.exists():
-                    clip_path = clip_path1
-                elif clip_path2.exists():
-                    clip_path = clip_path2
+                if toy_hazard_path is not None:
+                    clip_path = toy_clip_path
                 else:
-                    logging.info(f"Cannot find vector file for: {flood_path}")
-                    continue  # Skip further processing for this file
+                    # clip path
+                    clip_path = Path(
+                        flood_path.replace("Raster", "Vector").replace(".tif", ".shp")
+                    )
+                    clip_path1 = clip_path.with_name(clip_path.name.replace("_RD_", "_VE_"))
+                    clip_path2 = clip_path.with_name(clip_path.name.replace("_RD_", "_PR_"))
+                    if clip_path1.exists():
+                        clip_path = clip_path1
+                    elif clip_path2.exists():
+                        clip_path = clip_path2
+                    else:
+                        logging.info(f"Cannot find vector file for: {flood_path}")
+                        continue  # Skip further processing for this file
 
                 # intersections
                 temp_file = intersections_with_damage(
@@ -758,7 +940,7 @@ def main(depth_key, event_key):
                     flood_type,
                     flood_path,
                     clip_path,
-                    usa_boundary,
+                    analysis_boundary,
                 )
                 if temp_file is None:
                     continue
@@ -789,9 +971,7 @@ def main(depth_key, event_key):
         log_summary("intersections", intersections)
 
         # road integrations - reload fresh copy
-        road_links = gpd.read_parquet(
-            base_path / "networks" / "faf5" / "faf5_road_links.gpq"
-        )
+        road_links = gpd.read_parquet(road_links_path)
         road_links = features_with_damage(
             road_links,
             intersections,

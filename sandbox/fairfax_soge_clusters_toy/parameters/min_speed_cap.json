@@ -1,0 +1,15 @@
+{
+    "_comment": "This file contains the minimum speed caps for each OSM highway type. The minimum speed caps are used to determine the minimum speed of traffic on each highway type, which is then used to calculate the travel time on each edge in the graph.",
+    "M": 1.0,
+    "A_dual": 0.2,
+    "A_single": 0.2,
+    "B": 0.4,
+    "motorway": 1.0,
+    "motorway_link": 1.0,
+    "trunk": 0.2,
+    "primary": 0.2,
+    "secondary": 0.2,
+    "tertiary": 0.3,
+    "service": 0.4,
+    "unclassified": 0.4
+}

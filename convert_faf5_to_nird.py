@@ -283,7 +283,7 @@ def convert_faf5_links_to_nird(faf5_links, target_crs='EPSG:2163', filter_centro
     if 'Class' in faf5_links.columns:
         nird_links['road_classification'] = faf5_links['Class'].map(CLASS_MAPPING)
         # Fill any unmapped values with 'unclassified'
-        nird_links['road_classification'].fillna('unclassified', inplace=True)
+        nird_links['road_classification'] = nird_links['road_classification'].fillna('unclassified')
     else:
         nird_links['road_classification'] = 'unclassified'
     print(f"  ✓ road_classification: {nird_links['road_classification'].nunique()} types")
@@ -297,8 +297,7 @@ def convert_faf5_links_to_nird(faf5_links, target_crs='EPSG:2163', filter_centro
         nird_links['lanes'] = DEFAULTS['lanes']
     
     # Fill missing lanes with default
-    nird_links['lanes'].fillna(DEFAULTS['lanes'], inplace=True)
-    nird_links['lanes'] = nird_links['lanes'].astype(int)
+    nird_links['lanes'] = nird_links['lanes'].fillna(DEFAULTS['lanes']).astype(int)
     print(f"  ✓ lanes: {nird_links['lanes'].min()} to {nird_links['lanes'].max()}")
     
     # 7. Urban classification - based on Urban_Code

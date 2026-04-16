@@ -2,11 +2,15 @@ from pathlib import Path
 import sys
 import time
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import pandas as pd
 import geopandas as gpd  # type: ignore
 import duckdb
 
-from nird.utils import load_config
+from nird.utils import get_results_variant, load_config
 import nird.road_revised as func
 
 import logging
@@ -15,6 +19,15 @@ import warnings
 
 warnings.simplefilter("ignore")
 base_path = Path(load_config()["paths"]["soge_clusters"])
+
+
+def first_existing(paths):
+    """Return the first existing path from a sequence, else None."""
+    for path in paths:
+        p = Path(path)
+        if p.exists():
+            return p
+    return None
 
 
 def main(
@@ -51,29 +64,57 @@ def main(
     """
     start_time = time.time()
     db_path = base_path / "dbs" / "baseline.duckdb"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     logging.info(f"Database path is: {db_path}")
 
     # model parameters
-    with open(base_path / "parameters" / "flow_breakpoint_dict.json", "r") as f:
+
+    params_root = first_existing(
+        [
+            base_path / "parameters",
+            base_path / "inputs" / "parameters",
+        ]
+    )
+    if params_root is None:
+        raise FileNotFoundError(
+            "Could not find parameter folder. Checked base_path/parameters and base_path/inputs/parameters"
+        )
+
+    # model parameters
+    with open(params_root / "flow_breakpoint_dict.json", "r") as f:
         flow_breakpoint_dict = json.load(f)
-    with open(base_path / "parameters" / "flow_cap_plph_dict.json", "r") as f:
+    with open(params_root / "flow_cap_plph_dict.json", "r") as f:
         flow_capacity_dict = json.load(f)
-    with open(base_path / "parameters" / "free_flow_speed_dict.json", "r") as f:
+    with open(params_root / "free_flow_speed_dict.json", "r") as f:
         free_flow_speed_dict = json.load(f)
-    with open(base_path / "parameters" / "min_speed_cap.json", "r") as f:
+    with open(params_root / "min_speed_cap.json", "r") as f:
         min_speed_dict = json.load(f)
-    with open(base_path / "parameters" / "urban_speed_cap.json", "r") as f:
+    with open(params_root / "urban_speed_cap.json", "r") as f:
         urban_speed_dict = json.load(f)
     logging.info(flow_capacity_dict)
 
     # network links -> network links with bridges (SUBNETWORK)
-    road_link_file = gpd.read_parquet(
-        base_path / "networks" / "faf5" / "faf5_road_links.gpq"
+    road_links_path = first_existing(
+        [
+            base_path / "networks" / "faf5" / "faf5_road_links.gpq",
+            base_path / "inputs" / "networks" / "faf5" / "faf5_road_links.gpq",
+        ]
     )
+    if road_links_path is None:
+        raise FileNotFoundError("Could not find faf5_road_links.gpq in standard or toy input paths")
+    road_link_file = gpd.read_parquet(road_links_path)
+
     # od matrix (2021)
-    od_node_2021 = pd.read_parquet(
-        base_path / "census_datasets" / "faf5_od_matrix.pq"
+    od_path = first_existing(
+        [
+            base_path / "census_datasets" / "faf5_od_matrix.pq",
+            base_path / "inputs" / "census_datasets" / "faf5_od_matrix.pq",
+            base_path / "inputs" / "test_17node" / "faf5_od_matrix_17x17_test.pq",
+        ]
     )
+    if od_path is None:
+        raise FileNotFoundError("Could not find FAF5 OD matrix in standard or toy input paths")
+    od_node_2021 = pd.read_parquet(od_path)
 
     if sample_stride > 1:
         logging.info(f"For testing, sampling every {sample_stride} flows")
@@ -158,7 +199,7 @@ def main(
     )
 
     # export files
-    out_path = base_path.parent / "results" / "base_scenario" / "revision"
+    out_path = base_path.parent / "results" / "base_scenario" / get_results_variant()
     out_path.mkdir(parents=True, exist_ok=True)
     road_links.to_parquet(out_path / "edge_flows.gpq")
     isolation_df.to_parquet(out_path / "trip_isolations.pq")

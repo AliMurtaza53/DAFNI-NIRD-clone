@@ -2,6 +2,19 @@
 
 Based on actual FAF5 V2021.05 link data structure.
 
+## Table of Contents
+
+- [FAF5 Data Structure (Observed)](#faf5-data-structure-observed)
+- [Critical Column Mappings](#critical-column-mappings)
+- [Road Classification Mapping](#road-classification-mapping)
+- [Workflow](#workflow)
+- [Coordinate Reference Systems](#coordinate-reference-systems)
+- [Key Differences: FAF5 vs OSM (UK NIRD)](#key-differences-faf5-vs-osm-uk-nird)
+- [Tonnage to Vehicle Conversion](#tonnage-to-vehicle-conversion)
+- [Sample Data Check](#sample-data-check)
+- [Next Steps](#next-steps)
+- [Troubleshooting](#troubleshooting)
+
 ## FAF5 Data Structure (Observed)
 
 ### Link Attributes Available
@@ -69,7 +82,7 @@ node_id, SHAPE, Centroid, CentroidID
 
 Download from: https://ops.fhwa.dot.gov/freight/freight_analysis/faf/
 
-Files needed:
+**Files needed**
 - FAF5 Highway Network (geodatabase with links AND nodes)
 - FAF5 Regional Flows (OD data by zone)
 - FAF5 Zone boundaries (optional - can use centroid nodes instead)
@@ -86,7 +99,7 @@ TARGET_CRS = 'EPSG:2163'  # US Albers Equal Area
 python convert_faf5_to_nird.py
 ```
 
-Output: 
+**Outputs**
 - `faf5_road_links.gpq` - Real road network (Class 50 centroid connectors filtered out)
 - `faf5_road_nodes.gpq` - All network nodes
 - `faf5_centroid_nodes.gpq` - FAF zone centroid nodes with CentroidID
@@ -105,9 +118,9 @@ CENTROID_NODES_PATH = r"C:\Users\alimu\NIRD_Data\soge_clusters\networks\faf5\faf
 python convert_faf5_od_to_nird.py
 ```
 
-Output: `faf5_od_matrix.pq`
+**Output**: `faf5_od_matrix.pq`
 
-**Zone Mapping Methods**:
+**Zone mapping methods**
 1. **Preferred**: Uses FAF5 centroid nodes directly (CentroidID → nearest real network node)
 2. **Fallback**: Uses FAF zone geometries if centroid nodes not available
 
@@ -251,3 +264,7 @@ print(f"Unique destinations: {od['destination_node'].nunique()}")
 
 **Issue**: FAF zones not mapping to nodes
 - **Solution**: Check that `faf5_centroid_nodes.gpq` exists. If missing, rerun link conversion or provide FAF zone shapefile for fallback method.
+
+---
+
+If you are new to this repository, continue with [BEGINNER_REFERENCE_GUIDE.md](BEGINNER_REFERENCE_GUIDE.md) for the full script inventory, file catalog, and pipeline I/O reference.

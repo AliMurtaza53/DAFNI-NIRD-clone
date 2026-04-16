@@ -1,0 +1,14 @@
+{
+    "M": 67.0,
+    "A_dual": 45.0,
+    "A_single": 37.0,
+    "B": 37.0,
+    "motorway": 67.0,
+    "motorway_link": 67.0,
+    "trunk": 45.0,
+    "primary": 45.0,
+    "secondary": 45.0,
+    "tertiary": 37.0,
+    "service": 30.0,
+    "unclassified": 30.0
+}

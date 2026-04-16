@@ -217,7 +217,7 @@ def voc_func(speed: float) -> float:
     Returns
     -------
     float
-        The unit vehicle operating cost: £/km
+        The unit vehicle operating cost: $/km
     """
     s = speed * cons.CONV_MILE_TO_KM  # km/hour
     lpkm = 0.178 - 0.00299 * s + 0.0000205 * (s**2)  # fuel consumption (liter/km)
@@ -230,7 +230,7 @@ def cost_func(
     distance: float,
     voc: float,
     toll: float,
-) -> Tuple[float, float, float]:  # time: hour, distance: mph, voc: £/km
+) -> Tuple[float, float, float]:  # time: hour, distance: mph, voc: $/km
     """Calculate the total travel cost.
 
     Parameters
@@ -240,19 +240,19 @@ def cost_func(
     distance: float
         Travel distance: mile
     voc:
-        Vehicle operating cost: £/km
+        Vehicle operating cost: $/km
 
     Returns
     -------
     cost: float
-        The total travel costs: £
+        The total travel costs: $
     c_time: float
-        The time-equivalent costs: £
+        The time-equivalent costs: $
     c_operate: float
-        The vehicle operating costs/fuel costs: £
+        The vehicle operating costs/fuel costs: $
     """
     ave_occ = 1.06  # average car occupancy = 1.6
-    vot = 17.69  # value of time (VOT): 17.69 £/hour
+    vot = 22.46  # value of time (VOT): 22.46 $/hour (17.69 GBP/hour * 1.27 conversion)
     d = distance * cons.CONV_MILE_TO_KM
     c_time = time * ave_occ * vot
     c_operate = d * voc
@@ -467,14 +467,14 @@ def create_igraph_network(
     edgeLengthList = (
         road_links.geometry.length * cons.CONV_METER_TO_MILE
     ).tolist()  # mile
-    edgeTollList = road_links.average_toll_cost.tolist()  # £
+    edgeTollList = road_links.average_toll_cost.tolist()  # $
     edgeSpeedList = road_links.initial_flow_speeds.tolist()  # mph
 
     # travel time
     timeList = np.array(edgeLengthList) / np.array(edgeSpeedList)  # hour
 
-    # total travel cost (£)
-    vocList = np.vectorize(voc_func, otypes=None)(edgeSpeedList)  # £/km
+    # total travel cost ($)
+    vocList = np.vectorize(voc_func, otypes=None)(edgeSpeedList)  # $/km
     costList, timeCostList, operateCostList = np.vectorize(cost_func, otypes=None)(
         timeList, edgeLengthList, vocList, edgeTollList
     )

@@ -114,6 +114,12 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Dict[str, str]]:
     return config
 
 
+def get_results_variant(default: str = "revision") -> str:
+    """Return the active results subdirectory name for experiment runs."""
+    variant = os.environ.get("NIRD_RESULTS_VARIANT", default).strip()
+    return variant or default
+
+
 def create_network_from_nodes_and_edges(
     nodes: Optional[gpd.GeoDataFrame],
     edges: gpd.GeoDataFrame,

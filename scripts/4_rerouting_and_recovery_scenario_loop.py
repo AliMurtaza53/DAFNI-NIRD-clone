@@ -3,24 +3,86 @@ import sys
 import json
 import warnings
 import gc
+import ast
 
 from pathlib import Path
 from typing import Tuple, Dict
 import logging
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 
 import nird.road_revised as func
-from nird.utils import load_config, get_flow_on_edges
+from nird.utils import get_results_variant, load_config, get_flow_on_edges
 import duckdb
 
 # %%
 warnings.simplefilter("ignore")
 base_path = Path(load_config()["paths"]["soge_clusters"])
 tqdm.pandas()
+
+
+def first_existing(paths):
+    """Return first existing path from a sequence, else None."""
+    for path in paths:
+        p = Path(path)
+        if p.exists():
+            return p
+    return None
+
+
+def to_edge_id_list(value):
+    """Convert path-like values from parquet into a normalized list of edge-id strings."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+
+    # already list-like
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value if v is not None and str(v) != "nan"]
+
+    # numpy array from parquet/object coercion
+    if isinstance(value, np.ndarray):
+        vals = value.tolist()
+        # Handle character-array encodings of a stringified list
+        if vals and all(isinstance(v, str) and len(v) == 1 for v in vals):
+            joined = "".join(vals)
+            if joined.startswith("[") and joined.endswith("]"):
+                try:
+                    parsed = ast.literal_eval(joined)
+                    return [str(v) for v in parsed if v is not None and str(v) != "nan"]
+                except Exception:
+                    pass
+        if value.dtype.kind in {"U", "S"}:
+            joined = "".join(vals)
+            if joined.startswith("[") and joined.endswith("]"):
+                try:
+                    parsed = ast.literal_eval(joined)
+                    return [str(v) for v in parsed if v is not None and str(v) != "nan"]
+                except Exception:
+                    return [str(v) for v in vals if v not in {"[", "]", ",", " "}]
+        return [str(v) for v in vals if v is not None and str(v) != "nan"]
+
+    # stringified list
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                parsed = ast.literal_eval(s)
+                if isinstance(parsed, (list, tuple, set, np.ndarray)):
+                    return [str(v) for v in parsed if v is not None and str(v) != "nan"]
+            except Exception:
+                pass
+        # fallback: comma-separated tokens
+        return [tok.strip() for tok in s.split(",") if tok.strip()]
+
+    return [str(value)]
 
 
 # %%
@@ -52,9 +114,17 @@ def ordinary_road_recovery(
 
 def load_scenarios(base_path: Path) -> Tuple[Dict, Dict]:
     """Load recovery rates for bridges and ordinary roads."""
-    df = pd.read_csv(
-        base_path / "tables" / "recovery design_updated.csv",
+    scenario_path = first_existing(
+        [
+            base_path / "tables" / "recovery design_updated.csv",
+            base_path / "inputs" / "tables" / "recovery design_updated.csv",
+        ]
     )
+    if scenario_path is None:
+        raise FileNotFoundError(
+            "Could not find recovery dfesign_updated.csv in standard or toy input table paths"
+        )
+    df = pd.read_csv(scenario_path)
 
     bridge_recovery_dict = defaultdict(list)
     road_recovery_dict = defaultdict(list)
@@ -75,6 +145,72 @@ def load_scenarios(base_path: Path) -> Tuple[Dict, Dict]:
     return (bridge_recovery_dict, road_recovery_dict, scenarios, conditions)
 
 
+def load_event_damage_from_script3(base_path: Path, flood_key: int) -> Tuple[pd.DataFrame, float]:
+    """Load script-3 event damage CSV and aggregate per-edge damage level.
+
+    Returns
+    -------
+    Tuple[pd.DataFrame, float]
+        - DataFrame with columns ["e_id", "damage_level_max", "road_label"]
+        - total direct damage (sum of all *_damage_value_mean columns)
+    """
+    damage_csv = (
+        base_path.parent
+        / "results"
+        / "damage_analysis"
+        / get_results_variant()
+        / f"intersections_{flood_key}_with_damage_values.csv"
+    )
+    if not damage_csv.exists():
+        logging.warning(f"Script-3 damage output not found for event {flood_key}: {damage_csv}")
+        return pd.DataFrame(columns=["e_id", "damage_level_max", "road_label"]), 0.0
+
+    damage_df = pd.read_csv(damage_csv, low_memory=False)
+    if damage_df.empty:
+        return pd.DataFrame(columns=["e_id", "damage_level_max", "road_label"]), 0.0
+
+    # total direct damage from all mean damage columns
+    mean_cols = [c for c in damage_df.columns if c.endswith("_damage_value_mean")]
+    direct_damage_total = float(damage_df[mean_cols].fillna(0).sum().sum()) if mean_cols else 0.0
+
+    # aggregate event damage levels to a per-edge max
+    level_map = {"no": 0, "minor": 1, "moderate": 2, "extensive": 3, "severe": 4}
+    level_rev = {v: k for k, v in level_map.items()}
+
+    for col in ["damage_level_surface", "damage_level_river"]:
+        if col not in damage_df.columns:
+            damage_df[col] = "no"
+        # tolerate mixed str/int in CSV by coercing robustly
+        as_num = pd.to_numeric(damage_df[col], errors="coerce")
+        as_str_num = damage_df[col].astype(str).str.lower().map(level_map)
+        damage_df[col] = as_num.fillna(as_str_num).fillna(0).astype(int)
+
+    if "road_label" not in damage_df.columns:
+        damage_df["road_label"] = "road"
+    damage_df["road_label"] = damage_df["road_label"].astype(str).str.lower()
+    damage_df.loc[~damage_df["road_label"].isin(["road", "bridge", "tunnel"]), "road_label"] = "road"
+
+    damage_by_edge = (
+        damage_df.assign(damage_level_max_num=damage_df[["damage_level_surface", "damage_level_river"]].max(axis=1))
+        .groupby("e_id", as_index=False)
+        .agg(
+            {
+                "damage_level_max_num": "max",
+                "road_label": "first",
+            }
+        )
+    )
+    damage_by_edge["e_id"] = damage_by_edge["e_id"].astype(str)
+    damage_by_edge["damage_level_max"] = damage_by_edge["damage_level_max_num"].map(level_rev)
+    damage_by_edge = damage_by_edge[["e_id", "damage_level_max", "road_label"]]
+
+    logging.info(
+        f"Loaded script-3 damages for event {flood_key}: edges={len(damage_by_edge)}, "
+        f"direct_damage_total={direct_damage_total:.2f}"
+    )
+    return damage_by_edge, direct_damage_total
+
+
 def main(
     depth_key,
     flood_key,
@@ -83,10 +219,21 @@ def main(
 ):
     logging.info("Start...")
     db_path = base_path / "dbs" / f"recovery_{depth_key}_{flood_key}.duckdb"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     logging.info(f"Database path is: {db_path}")
 
     # Load network parameters
-    with open(base_path / "parameters" / "flow_breakpoint_dict.json", "r") as f:
+    breakpoint_path = first_existing(
+        [
+            base_path / "parameters" / "flow_breakpoint_dict.json",
+            base_path / "inputs" / "parameters" / "flow_breakpoint_dict.json",
+        ]
+    )
+    if breakpoint_path is None:
+        raise FileNotFoundError(
+            "Could not find flow_breakpoint_dict.json in standard or toy parameter paths"
+        )
+    with open(breakpoint_path, "r") as f:
         flow_breakpoint_dict = json.load(f)
 
     # Load recovery scenarios
@@ -98,11 +245,12 @@ def main(
     ) = load_scenarios(base_path)
 
     # Load pre-identified odpfc (containing flooded links)
+    results_variant = get_results_variant()
     odpfc_path = (
         base_path.parent
         / "results"
         / "disruption_analysis"
-        / "revision"
+        / results_variant
         / "od"
         / f"odpfc_{depth_key}_{flood_key}.pq"
     )
@@ -111,7 +259,7 @@ def main(
             f"Missing odpfc at {odpfc_path}. Falling back to base scenario odpfc."
         )
         base_odpfc_path = (
-            base_path.parent / "results" / "base_scenario" / "revision" / "odpfc.pq"
+            base_path.parent / "results" / "base_scenario" / results_variant / "odpfc.pq"
         )
         if base_odpfc_path.exists():
             odpfc_path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,17 +269,38 @@ def main(
             sys.exit(1)
 
     disrupted_candidates = pd.read_parquet(odpfc_path)
+    if "path" in disrupted_candidates.columns:
+        disrupted_candidates["path"] = disrupted_candidates["path"].apply(to_edge_id_list)
+    if "flood_links" in disrupted_candidates.columns:
+        disrupted_candidates["flood_links"] = disrupted_candidates["flood_links"].apply(
+            to_edge_id_list
+        )
     disrupted_candidates["od_id"] = disrupted_candidates.index  # numbering od pairs
     # Load road links with damage (e.g., flood depth and damage level)
     road_links = gpd.read_parquet(
         base_path.parent
         / "results"
         / "disruption_analysis"
-        / "revision"
+        / results_variant
         / str(depth_key)
         / "links"
         / f"road_links_{flood_key}.gpq"
     )
+    road_links["e_id"] = road_links["e_id"].astype(str)
+
+    # Wire to script-3 outputs (direct damage table by event)
+    damage_by_edge, direct_damage_total = load_event_damage_from_script3(base_path, flood_key)
+    if len(damage_by_edge) > 0:
+        if "damage_level_max" in road_links.columns:
+            road_links = road_links.drop(columns=["damage_level_max"])
+        road_links = road_links.merge(damage_by_edge, on="e_id", how="left")
+        road_links["damage_level_max"] = road_links["damage_level_max"].fillna("no")
+
+        # Prefer road_label from script 3 if present
+        if "road_label_x" in road_links.columns and "road_label_y" in road_links.columns:
+            road_links["road_label"] = road_links["road_label_y"].fillna(road_links["road_label_x"])
+            road_links = road_links.drop(columns=["road_label_x", "road_label_y"])
+
     # FAF data does not include road_label; create a default
     if "road_label" not in road_links.columns:
         road_links["road_label"] = "road"
@@ -151,7 +320,7 @@ def main(
             road_links.loc[road_links["damage_level_max"] != "no", "e_id"]
         )
         disrupted_candidates["flood_links"] = disrupted_candidates["path"].apply(
-            lambda p: [e for e in (list(p) if p is not None else []) if e in flooded_edges]
+            lambda p: [e for e in p if e in flooded_edges]
         )
         disrupted_candidates = disrupted_candidates[
             disrupted_candidates["flood_links"].map(len) > 0
@@ -163,7 +332,7 @@ def main(
         base_path.parent
         / "results"
         / "rerouting_analysis"
-        / "revision"
+        / results_variant
         / str(depth_key)
         / str(flood_key)
     )
@@ -299,16 +468,7 @@ def main(
         )
 
         logging.info("Updating road speed limits...")
-        road_links["acc_speed"] = road_links.apply(
-            lambda x: func.update_edge_speed(
-                x["combined_label"],  # constant
-                x["acc_flow"],  # variable
-                x["initial_flow_speeds"],  # constant
-                x["min_flow_speeds"],  # constant
-                x["breakpoint_flows"],  # constant
-            ),
-            axis=1,
-        )
+        func.update_edge_speed(road_links, inplace=True)
         if event_day == 1:  # apply speed constraint to every road
             road_links["acc_speed"] = road_links[["acc_speed", "max_speed"]].min(axis=1)
         if (
@@ -331,19 +491,20 @@ def main(
         valid_road_links = road_links[
             (road_links["acc_capacity"] > 0) & (road_links["acc_speed"] > 0)
         ].reset_index(drop=True)
-        network, valid_road_links = func.create_igraph_network(valid_road_links)
+        valid_road_links["from_id"] = valid_road_links["from_id"].astype(str)
+        valid_road_links["to_id"] = valid_road_links["to_id"].astype(str)
+        network, valid_road_links = func.create_igraph_network(valid_road_links, vehicle_type="car")
 
         # !!! make sure to pass disrupted flow for rerouting analysis
         disrupted_od.rename(columns={"disrupted_flow": "Car21"}, inplace=True)
+        disrupted_od["origin_node"] = disrupted_od["origin_node"].astype(str)
+        disrupted_od["destination_node"] = disrupted_od["destination_node"].astype(str)
 
         # Run flow model
         logging.info("Running flow simulation...")
-        (
-            valid_road_links,
-            isolation,
-            _,
-            (post_time, post_operate, post_toll, total_post_cost),
-        ) = func.network_flow_model(
+        isolation_path = out_path / f"trip_isolations_{scenario_idx}.pq"
+        odpfc_path_iter = out_path / f"odpfc_{scenario_idx}.pq"
+        valid_road_links, (post_time, post_operate, post_toll, total_post_cost) = func.network_flow_model(
             valid_road_links,  # update this one
             network,
             disrupted_od[
@@ -353,6 +514,9 @@ def main(
             num_of_chunk,
             num_of_cpu,
             db_path,
+            iso_out_path=str(isolation_path),
+            odpfc_out_path=str(odpfc_path_iter),
+            vehicle_type="car",
         )
 
         # estimate rerouting cost matrix
@@ -361,13 +525,13 @@ def main(
         rer_toll = post_toll - pre_toll
         rerouting_cost = rer_time + rer_operate + rer_toll
         logging.info(
-            f"The original travel costs for disrupted od: £ million {total_pre_cost/ 1e6}"
+            f"The original travel costs for disrupted od: $ million {total_pre_cost/ 1e6}"
         )
         logging.info(
-            f"The total travel costs after disruption: £ million {total_post_cost/ 1e6}"
+            f"The total travel costs after disruption: $ million {total_post_cost/ 1e6}"
         )
         logging.info(
-            f"The rerouting cost for scenario {scenario_idx}: £ million {rerouting_cost / 1e6}"
+            f"The rerouting cost for scenario {scenario_idx}: $ million {rerouting_cost / 1e6}"
         )
 
         logging.info("Saving results to disk...")
@@ -380,29 +544,53 @@ def main(
             columns=["rer_time", "rer_operate", "rer_toll", "rerouting_cost"],
         ).reset_index()
         cost_df.rename(columns={"index": "scenario"}, inplace=True)
+        cost_df["direct_damage_total"] = direct_damage_total
+        cost_df["combined_total_cost"] = cost_df["rerouting_cost"] + cost_df["direct_damage_total"]
         cost_df.to_csv(out_path / f"rerouting_cost_{scenario_idx}.csv", index=False)
 
         # trip isolations
-        isolation_df = pd.DataFrame(
-            isolation,
-            columns=[
-                "origin_node",
-                "destination_node",
-                "Car21",
-            ],
-        )
+        if isolation_path.exists():
+            isolation_df = pd.read_parquet(isolation_path)
+            if "flow" in isolation_df.columns:
+                isolation_df = isolation_df.rename(columns={"flow": "Car21"})
+        else:
+            isolation_df = pd.DataFrame(columns=["origin_node", "destination_node", "Car21"])
+
         isolation_df = isolation_df[
             (isolation_df.origin_node != isolation_df.destination_node)
             & (isolation_df.Car21 > 0)
-        ].reset_index()
+        ].reset_index(drop=True)
         isolation_df.to_csv(
             out_path / f"trip_isolations_{scenario_idx}.csv",
             index=False,
         )
 
         # edge flows
+        def _to_scalar_float(value):
+            if isinstance(value, np.ndarray):
+                arr = np.asarray(value).reshape(-1)
+                if arr.size == 0:
+                    return np.nan
+                return float(arr[0])
+            if isinstance(value, (list, tuple, set)):
+                arr = np.asarray(list(value)).reshape(-1)
+                if arr.size == 0:
+                    return np.nan
+                return float(arr[0])
+            if value is None:
+                return np.nan
+            try:
+                return float(value)
+            except Exception:
+                return np.nan
+
+        valid_road_links = valid_road_links.copy()
+        valid_road_links["acc_flow"] = valid_road_links["acc_flow"].apply(_to_scalar_float).astype(float)
+        road_links["acc_flow"] = pd.to_numeric(road_links["acc_flow"], errors="coerce").astype(float)
+        road_links["current_flow"] = pd.to_numeric(road_links["current_flow"], errors="coerce").astype(float)
         road_links = road_links.set_index("e_id")
-        road_links.update(valid_road_links.set_index("e_id")["acc_flow"])
+        updated_acc_flow = valid_road_links.set_index("e_id")["acc_flow"].astype(float)
+        road_links.loc[updated_acc_flow.index, "acc_flow"] = updated_acc_flow.to_numpy(dtype=float)
         road_links = road_links.reset_index()
         road_links["change_flow"] = road_links["acc_flow"] - road_links["current_flow"]
         road_links.to_parquet(out_path / f"edge_flows_{scenario_idx}.gpq")
@@ -425,6 +613,8 @@ def main(
         columns=["rer_time", "rer_operate", "rer_toll", "rerouting_cost"],
     ).reset_index()
     cost_df.rename(columns={"index": "scenario"}, inplace=True)
+    cost_df["direct_damage_total"] = direct_damage_total
+    cost_df["combined_total_cost"] = cost_df["rerouting_cost"] + cost_df["direct_damage_total"]
     cost_df.to_csv(out_path / "cost_matrix_by_scenario.csv", index=False)
 
 

@@ -1,19 +1,33 @@
 import os
+import sys
 import warnings
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Tuple
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from nird.utils import load_config
+from nird.utils import get_results_variant, load_config
 from snail import damages
 
 warnings.simplefilter("ignore")
 
 base_path = Path(load_config()["paths"]["soge_clusters"])
+
+
+def first_existing(paths):
+    """Return first existing path from a sequence, else None."""
+    for path in paths:
+        p = Path(path)
+        if p.exists():
+            return p
+    return None
 
 
 def create_damage_curves(damage_ratio_df: pd.DataFrame) -> Dict:
@@ -39,20 +53,41 @@ def create_damage_curves(damage_ratio_df: pd.DataFrame) -> Dict:
     C6: other roads, high flow
     """
 
-    list_of_damage_curves = []
-    cols = damage_ratio_df.columns[1:]
+    # Build curves from every available damage column (all except intensity)
+    cols = [c for c in damage_ratio_df.columns if c != "intensity"]
+    curve_by_col = {}
     for col in cols:
-        damage_ratios = damage_ratio_df[["intensity", col]]
+        damage_ratios = damage_ratio_df[["intensity", col]].copy()
         damage_ratios.rename(columns={col: "damage"}, inplace=True)
-        damage_curve = damages.PiecewiseLinearDamageCurve(damage_ratios)
-        list_of_damage_curves.append(damage_curve)
+        curve_by_col[col] = damages.PiecewiseLinearDamageCurve(damage_ratios)
 
     damage_curve_dict = defaultdict()
     keys = ["C1", "C2", "C3", "C4", "C5", "C6"]
-    for idx in range(len(keys)):
-        key = keys[idx]
-        damage_curve = list_of_damage_curves[idx]
-        damage_curve_dict[key] = damage_curve
+
+    # Preferred mapping for toy/US lookup tables
+    preferred_order = [
+        "Interstate",   # C1
+        "Interstate",   # C2
+        "US Route",     # C3
+        "US Route",     # C4
+        "State Route",  # C5
+        "Local",        # C6
+    ]
+
+    # Fallback sequence if preferred labels are not present
+    fallback_cols = list(curve_by_col.keys())
+    if not fallback_cols:
+        raise ValueError("No damage curve columns were found in damage_ratio_df")
+
+    for idx, key in enumerate(keys):
+        preferred_col = preferred_order[idx]
+        if preferred_col in curve_by_col:
+            damage_curve_dict[key] = curve_by_col[preferred_col]
+        elif idx < len(fallback_cols):
+            damage_curve_dict[key] = curve_by_col[fallback_cols[idx]]
+        else:
+            # Reuse the last available curve if fewer than 6 columns exist
+            damage_curve_dict[key] = curve_by_col[fallback_cols[-1]]
 
     return damage_curve_dict
 
@@ -122,7 +157,7 @@ def compute_damage_values(
     lanes: int,
     road_label: str,
     damage_level: str,
-    damage_values: float,  # million £/unit
+    damage_values: float,  # million $/unit
     bridge_width=None,
 ) -> Tuple[float, float, float]:
     """
@@ -150,7 +185,7 @@ def compute_damage_values(
     damage_level : str
         The severity level of damage (e.g., "minor", "major", "catastrophic").
     damage_values : dict
-        A nested dictionary containing damage cost values (in million £/unit) for
+        A nested dictionary containing damage cost values (in million $/unit) for
         different infrastructure types,
         flood types, and damage levels. The dictionary should have the structure:
         {
@@ -190,6 +225,17 @@ def compute_damage_values(
         )
         return min_damage, max_damage
 
+    def fallback_asset_label(road_classification: str) -> str:
+        """Map road class to toy asset-cost labels when detailed UK keys are absent."""
+        rc = "" if road_classification is None else str(road_classification).strip().lower()
+        if rc in {"motorway", "motorway_link", "trunk", "interstate"}:
+            return "Interstate"
+        if rc in {"primary", "secondary", "a road", "us route"}:
+            return "US Route"
+        if rc in {"tertiary", "service", "b road", "state route"}:
+            return "State Route"
+        return "Local"
+
     if road_label == "bridge":
         if bridge_width is None:
             raise ValueError("Bridge width is required for bridges!")
@@ -208,6 +254,11 @@ def compute_damage_values(
         else:  # Dual Carriageway
             lane_key = "ge6" if lanes >= 6 else "lt6"
             key = f"abdual_{lane_key}_{urban_key}"
+
+        # Toy lookup tables may only provide coarse labels (Interstate/US Route/...).
+        # If the detailed UK-style key is missing, fallback to mapped coarse label.
+        if key not in damage_values[road_label]:
+            key = fallback_asset_label(road_classification)
 
         min_cost, max_cost = compute_tunnel_or_road_damage(
             length, lanes, road_label, key, damage_fraction
@@ -366,6 +417,24 @@ def format_intersections(
         A formatted and enriched DataFrame of intersections.
     """
 
+    # ---------------------------------------------------------------------
+    # PERFORMANCE / DATA-CLEANLINESS NOTE
+    # ---------------------------------------------------------------------
+    # Script 2 can emit sentinel rows with index_i/index_j == -1 when a
+    # segment does not map onto a valid raster grid cell index. These rows
+    # do not represent actionable flooded intersections and typically carry
+    # null flood-depth / damage-level fields downstream.
+    #
+    # Keeping them creates large, noisy outputs and unnecessary per-row
+    # damage computations in Script 3. We drop them early to:
+    #   1) reduce processing time,
+    #   2) keep output CSVs focused on real intersection segments,
+    #   3) prevent NaN-only C*_damage_* rows in final outputs.
+    # ---------------------------------------------------------------------
+    if {"index_i", "index_j"}.issubset(intersections.columns):
+        sentinel_mask = (intersections["index_i"] == -1) & (intersections["index_j"] == -1)
+        intersections = intersections.loc[~sentinel_mask].copy()
+
     # Define default values for missing columns
     columns_to_add = {
         "flood_depth_surface": 0.0,
@@ -389,7 +458,8 @@ def format_intersections(
         if col not in intersections.columns:
             intersections[col] = default_value
         else:
-            intersections[col].fillna(default_value, inplace=True)
+            # Avoid inplace chained-assignment behavior; assign explicitly.
+            intersections[col] = intersections[col].fillna(default_value)
 
     # Map damage levels to numeric values
     for col in ["damage_level_surface", "damage_level_river"]:
@@ -404,6 +474,13 @@ def format_intersections(
     # Reverse map numeric damage levels back to strings
     for col in ["damage_level_surface", "damage_level_river"]:
         intersections_gp[col] = intersections_gp[col].map(damage_level_dict_reverse)
+
+    # Defensive normalization after groupby/map in case any NaNs remain.
+    # This ensures downstream filtering (`== "no"`) behaves consistently.
+    intersections_gp["flood_depth_surface"] = intersections_gp["flood_depth_surface"].fillna(0.0)
+    intersections_gp["flood_depth_river"] = intersections_gp["flood_depth_river"].fillna(0.0)
+    intersections_gp["damage_level_surface"] = intersections_gp["damage_level_surface"].fillna("no")
+    intersections_gp["damage_level_river"] = intersections_gp["damage_level_river"].fillna("no")
     # Build a robust attributes frame from road links (supports FAF5 + UK subnetwork)
     rl = road_links.copy()
     if "road_label" not in rl.columns:
@@ -483,59 +560,118 @@ def main():
     Returns:
         None: Outputs are saved to files.
     """
-    # damage curves
-    damages_ratio_df = pd.read_excel(
-        base_path / "damage_curves" / "damage_ratio_road_flood.xlsx"
+    damage_ratio_path = first_existing(
+        [
+            base_path / "damage_curves" / "damage_ratio_road_flood.xlsx",
+            base_path / "damage_curves" / "damage_ratio_road_flood_uk.xlsx",
+            base_path / "inputs" / "lookup" / "damage_ratio_road_flood.xlsx",
+            base_path / "inputs" / "lookup" / "damage_ratio_road_flood_uk.xlsx",
+            base_path / "tables" / "damage_ratio_road_flood.xlsx",
+            base_path / "tables" / "damage_ratio_road_flood_uk.xlsx",
+        ]
     )
+    if damage_ratio_path is None:
+        raise FileNotFoundError("Could not find damage_ratio_road_flood.xlsx in standard or toy lookup paths")
+
+    damage_cost_path = first_existing(
+        [
+            base_path / "asset_costs" / "damage_cost_road_flood_uk.xlsx",
+            base_path / "inputs" / "lookup" / "damage_cost_road_flood_uk.xlsx",
+            base_path / "tables" / "damage_cost_road_flood_uk.xlsx",
+        ]
+    )
+    if damage_cost_path is None:
+        raise FileNotFoundError("Could not find damage_cost_road_flood_uk.xlsx in standard or toy lookup paths")
+
+    # damage curves
+    damages_ratio_df = pd.read_excel(damage_ratio_path)
     damage_curves = create_damage_curves(damages_ratio_df)
 
     # road links: prefer FAF5 for USA runs, fallback to UK subnetwork
-    faf5_links_path = base_path / "networks" / "faf5" / "faf5_road_links.gpq"
+    faf5_links_path = first_existing(
+        [
+            base_path / "networks" / "faf5" / "faf5_road_links.gpq",
+            base_path / "inputs" / "networks" / "faf5" / "faf5_road_links.gpq",
+        ]
+    )
     gb_subnetwork_path = (
         base_path / "networks" / "test_subnetwork" / "GB_road_links_with_bridges_subnetwork.gpq"
     )
-    if faf5_links_path.exists():
+    if faf5_links_path is not None and faf5_links_path.exists():
         road_links = gpd.read_parquet(faf5_links_path)
     else:
         road_links = gpd.read_parquet(gb_subnetwork_path)
-    road_damage_file = pd.read_excel(
-        base_path / "asset_costs" / "damage_cost_road_flood_uk.xlsx", sheet_name="roads"
-    )
-    tunnel_damage_file = pd.read_excel(
-        base_path / "asset_costs" / "damage_cost_road_flood_uk.xlsx",
-        sheet_name="tunnels",
-    )
-    bridge_surface_damage_file = pd.read_excel(
-        base_path / "asset_costs" / "damage_cost_road_flood_uk.xlsx",
-        sheet_name="bridges-surface",
-    )
-    bridge_river_damage_file = pd.read_excel(
-        base_path / "asset_costs" / "damage_cost_road_flood_uk.xlsx",
-        sheet_name="bridges-river",
-    )
+    xls = pd.ExcelFile(damage_cost_path)
+    available_sheets = set(xls.sheet_names)
+
+    def normalize_cost_df(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out.columns = [str(c).strip().lower() for c in out.columns]
+        return out
+
+    road_damage_file = normalize_cost_df(pd.read_excel(damage_cost_path, sheet_name="roads"))
+
+    if "tunnels" in available_sheets:
+        tunnel_damage_file = normalize_cost_df(pd.read_excel(damage_cost_path, sheet_name="tunnels"))
+    else:
+        # Toy workbook fallback: reuse road costs for tunnel costs.
+        tunnel_damage_file = road_damage_file.copy()
+
+    if "bridges-surface" in available_sheets:
+        bridge_surface_damage_file = normalize_cost_df(
+            pd.read_excel(damage_cost_path, sheet_name="bridges-surface")
+        )
+    elif "bridges" in available_sheets:
+        bridge_surface_damage_file = normalize_cost_df(pd.read_excel(damage_cost_path, sheet_name="bridges"))
+    else:
+        raise FileNotFoundError("Bridge damage-cost sheet not found in damage_cost workbook")
+
+    if "bridges-river" in available_sheets:
+        bridge_river_damage_file = normalize_cost_df(
+            pd.read_excel(damage_cost_path, sheet_name="bridges-river")
+        )
+    elif "bridges" in available_sheets:
+        bridge_river_damage_file = normalize_cost_df(pd.read_excel(damage_cost_path, sheet_name="bridges"))
+    else:
+        raise FileNotFoundError("Bridge damage-cost sheet not found in damage_cost workbook")
     dv_road_dict = defaultdict(lambda: defaultdict(float))
     for row in road_damage_file.itertuples():
-        dv_road_dict[row.label]["min"] = row.Min
-        dv_road_dict[row.label]["max"] = row.Max
-        dv_road_dict[row.label]["mean"] = row.Mean
+        dv_road_dict[row.label]["min"] = row.min
+        dv_road_dict[row.label]["max"] = row.max
+        dv_road_dict[row.label]["mean"] = row.mean
 
     dv_tunnel_dict = defaultdict(lambda: defaultdict(float))
     for row in tunnel_damage_file.itertuples():
-        dv_tunnel_dict[row.label]["min"] = row.Min
-        dv_tunnel_dict[row.label]["max"] = row.Max
-        dv_tunnel_dict[row.label]["mean"] = row.Mean
+        dv_tunnel_dict[row.label]["min"] = row.min
+        dv_tunnel_dict[row.label]["max"] = row.max
+        dv_tunnel_dict[row.label]["mean"] = row.mean
 
     dv_bridge_surface_dict = defaultdict(lambda: defaultdict(float))
     for row in bridge_surface_damage_file.itertuples():
-        dv_bridge_surface_dict[row.label]["min"] = row.min
-        dv_bridge_surface_dict[row.label]["max"] = row.max
-        dv_bridge_surface_dict[row.label]["mean"] = row.mean
+        # support both detailed (damage-level rows) and toy single-row bridge costs
+        label = row.label
+        if label not in {"no", "minor", "moderate", "extensive", "severe"}:
+            for lvl in ["no", "minor", "moderate", "extensive", "severe"]:
+                dv_bridge_surface_dict[lvl]["min"] = row.min
+                dv_bridge_surface_dict[lvl]["max"] = row.max
+                dv_bridge_surface_dict[lvl]["mean"] = row.mean
+        else:
+            dv_bridge_surface_dict[label]["min"] = row.min
+            dv_bridge_surface_dict[label]["max"] = row.max
+            dv_bridge_surface_dict[label]["mean"] = row.mean
 
     dv_bridge_river_dict = defaultdict(lambda: defaultdict(float))
     for row in bridge_river_damage_file.itertuples():
-        dv_bridge_river_dict[row.label]["min"] = row.min
-        dv_bridge_river_dict[row.label]["max"] = row.max
-        dv_bridge_river_dict[row.label]["mean"] = row.mean
+        label = row.label
+        if label not in {"no", "minor", "moderate", "extensive", "severe"}:
+            for lvl in ["no", "minor", "moderate", "extensive", "severe"]:
+                dv_bridge_river_dict[lvl]["min"] = row.min
+                dv_bridge_river_dict[lvl]["max"] = row.max
+                dv_bridge_river_dict[lvl]["mean"] = row.mean
+        else:
+            dv_bridge_river_dict[label]["min"] = row.min
+            dv_bridge_river_dict[label]["max"] = row.max
+            dv_bridge_river_dict[label]["mean"] = row.mean
 
     damage_values = {
         "road": dv_road_dict,
@@ -546,27 +682,33 @@ def main():
 
     # Load intersection data and assign attributes for damage calculations
     # batch process
+    results_variant = get_results_variant()
+
     intersections_list = []
     for root, _, files in os.walk(
-        base_path.parent
-        / "results"
-        / "disruption_analysis"
-        / "revision"
-        / "15"
-        / "intersections"
+        base_path.parent / "results" / "disruption_analysis" / results_variant
     ):
         for file in files:
-            intersections_path = Path(root) / file
-            intersections_list.append(intersections_path)
+            if file.startswith("intersections_") and file.endswith(".pq"):
+                intersections_path = Path(root) / file
+                intersections_list.append(intersections_path)
+
+    if len(intersections_list) == 0:
+        print("No intersections files found under results/disruption_analysis/revision. Skipping.")
+        return
 
     for intersections_path in intersections_list:
         flood_key = intersections_path.stem
-        out_path = base_path.parent / "results" / "damage_analysis" / "revision"
+        out_path = base_path.parent / "results" / "damage_analysis" / results_variant
 
         print(f"Calculate damages for {flood_key}...")
         # format intersections
         intersections = pd.read_parquet(intersections_path)
         intersections = format_intersections(intersections, road_links)
+
+        if intersections.empty:
+            print(f"Skipping {flood_key}: no valid raster-intersection segments after filtering")
+            continue
 
         # append a few more columns into the table
         intersections["surface_unit_cost_min"] = np.nan

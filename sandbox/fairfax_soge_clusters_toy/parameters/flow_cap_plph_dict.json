@@ -1,0 +1,14 @@
+{
+    "M": 2500,
+    "A_dual": 1500,
+    "A_single": 1500,
+    "B": 2200,
+    "motorway": 2500,
+    "motorway_link": 2500,
+    "trunk": 1700,
+    "primary": 1500,
+    "secondary": 1500,
+    "tertiary": 1300,
+    "service": 1000,
+    "unclassified": 1000
+}
