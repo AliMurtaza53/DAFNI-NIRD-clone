@@ -4,7 +4,6 @@ National Infrastructure Resilience Demonstrator (NIRD)
 
 **A reproducible workflow for assessing road network disruption, damage, and recovery under flooding scenarios.**
 
----
 
 ## Quick Start: Running the Reproducible Demo
 
@@ -12,10 +11,6 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
 
 ### Prerequisites
 
-- Python 3.9+
-- Conda/Micromamba
-- ~2–3 GB disk space (for data + output)
-- 30–60 minutes (full pipeline runtime depends on hardware)
 
 ### Setup in 5 Steps
 
@@ -77,7 +72,6 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
 
 **Output**: Results and figures are saved to `results/` directory.
 
----
 
 ## Workflow Overview
 
@@ -108,16 +102,12 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
       └─ Generate summary figures and diagnostic plots
 ```
 
----
 
 ## Data & Configuration
 
 ### Data Files
 
 All input data files are documented in [data/README.md](data/README.md):
-- Study area boundary (GeoJSON/GeoPackage)
-- FAF5 road network (Parquet GeoDataFrame)
-- OD flow matrices and node mappings (Parquet + CSV)
 
 **Total data size**: ~30–75 MB (compressible to ~5–10 MB)
 
@@ -136,14 +126,9 @@ The `config.json` file is **pre-configured** with relative paths:
 ```
 
 All scripts read from these paths automatically. **You only need to customize `config.json` if:**
-- You store data in a different location (e.g., OneDrive symlink)
-- You want output saved elsewhere instead of `results/`
 
 If you need to modify paths, edit the `paths` section with either:
-- **Relative paths**: `data/fairfax_soge_clusters_toy` (recommended; relative to repo root)
-- **Absolute paths**: `/Users/your_name/path/to/fairfax_soge_clusters_toy` (not portable; use only if necessary)
 
----
 
 ## Development Setup (for Contributors)
 
@@ -209,10 +194,7 @@ To add new pre-commit hooks, configure them in `.pre-commit-config.yaml` then ru
 
 This clean demo branch does not include the previous `docs/` site or its Sphinx build files.
 Use the notebook and the two README files in this repository instead:
-- [README.md](README.md)
-- [data/README.md](data/README.md)
 
----
 
 ## Troubleshooting
 
@@ -248,7 +230,6 @@ If Jupyter notebooks fail to load:
 jupyter nbconvert --to notebook --execute scripts/visualize_pipeline_results.ipynb
 ```
 
----
 
 ## Outstanding Issues & TODOs
 
@@ -259,7 +240,6 @@ jupyter nbconvert --to notebook --execute scripts/visualize_pipeline_results.ipy
 5. **Check whether a 500x scenario** triggers script 4 recovery as it should (verify scenario multiplier scaling in recovery logic)
 6. **Centroid connector filtering** – ensure centroid connectors are consistently excluded from damage totals across all pipeline outputs (currently filtered in visualization layer; best practice would move to converter or damage-analysis script)
 
----
 
 ## File Structure (Cleaned Demo Branch)
 
@@ -300,16 +280,10 @@ DAFNI-NIRD/
 └── LICENSE                        # Project license
 ```
 
----
 
 ## Key References
 
-- **NIRD Framework**: Infrastructure resilience assessment under climate hazards
-- **FAF5 Network**: Freight Analysis Framework v5 by U.S. Department of Transportation
-- **Flood Scenarios**: Synthetic hazard scenarios for demonstration purposes
-- **Recovery Model**: Dynamic link-by-link recovery based on capacity restoration
 
----
 
 ## Contact & Attribution
 
@@ -323,7 +297,6 @@ DAFNI-NIRD/
 GitHub: https://github.com/nismod/DAFNI-NIRD
 ```
 
----
 
 ## Docker and DAFNI (Full Production Setup)
 
