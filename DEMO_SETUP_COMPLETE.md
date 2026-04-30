@@ -11,9 +11,9 @@ Your repository has been successfully cleaned and is now ready for sharing with 
 ### 1. ✅ Branch Created
 - **Branch name**: `demo/clean-sandbox-reproducible`
 - **Purpose**: Isolated, clean snapshot for external reproduction
-- **Current status**: All changes staged and ready to commit
+- **Current status**: Branch committed and pushed; ready for advisor review
 
-### 2. ✅ Repository Cleanup (164 deletions)
+### 2. ✅ Repository Cleanup (large cleanup completed)
 
 **Removed directories** (not needed for demo):
 - `sandbox/` – toy data & experiments (moved to SharePoint)
@@ -27,7 +27,7 @@ Your repository has been successfully cleaned and is now ready for sharing with 
 - `BEGINNER_REFERENCE_GUIDE.md`, `BRANCH_ROADMAP.md`, `FAF5_*_GUIDE.md`, etc.
 - `.docx`, `.pptx`, `.pdf` presentation files
 
-**Result**: ~30+ MB freed; cleaner, focused codebase
+**Result**: repository reduced to the workflow essentials and shared data moved out to SharePoint
 
 ### 3. ✅ Data Documentation Created
 

@@ -183,28 +183,12 @@ To add new pre-commit hooks, configure them in `.pre-commit-config.yaml` then ru
 
     pre-commit run --all-files
 
-### Building documentation
+### Documentation
 
-The documentation site is developed in the `./docs` directory using [Sphinx](https://www.sphinx-doc.org/en/master/usage/index.html).
-
-To build the docs:
-
-```bash
-cd docs
-# generate the API docs (this pulls information from the code and docstrings)
-sphinx-apidoc -M -o source/api ../src/nird/ --force
-# build the documentation site
-make html
-```
-
-To preview the site:
-
-```
-cd build/html
-python -m http.server
-```
-
-Then open a browser at the address shown (e.g. `http://0.0.0.0:8000`).
+This clean demo branch does not include the previous `docs/` site or its Sphinx build files.
+Use the notebook and the two README files in this repository instead:
+- [README.md](README.md)
+- [data/README.md](data/README.md)
 
 ---
 
@@ -234,26 +218,6 @@ If Jupyter notebooks fail to load:
 ```bash
 jupyter nbconvert --to notebook --execute scripts/visualize_pipeline_results.ipynb
 ```
-
----
-
-## Docker Deployment (Optional)
-
-For deployment on DAFNI or containerized environments, Docker images are available in a companion repository:
-
-```bash
-# Build recovery image
-docker build -f ./containers/nird_road/Dockerfile-recovery -t nismod/nird_road-recovery:latest .
-
-# Run with test data
-docker run --rm \
-  -v ${PWD}/data:/data/inputs \
-  -v ${PWD}/results:/data/outputs \
-  --env NUMBER_CPUS=4 \
-  nismod/nird_road-recovery:latest
-```
-
-Note: Docker setup requires additional repository configuration. Contact the project team for DAFNI deployment details.
 
 ---
 
