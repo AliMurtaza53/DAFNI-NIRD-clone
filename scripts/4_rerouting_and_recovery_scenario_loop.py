@@ -10,8 +10,11 @@ from typing import Tuple, Dict
 import logging
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.insert(1, str(REPO_ROOT))
 
 import geopandas as gpd
 import pandas as pd
@@ -338,15 +341,14 @@ def main(
     )
     out_path.mkdir(parents=True, exist_ok=True)
     # Load link recovery scenarios (both capacity and speed)
-    for scenario_idx in range(len(scenarios)):
-        logging.info(f"Rerouting Analysis on Scenario-{scenario_idx} of recovery...")
-        event_day = conditions[scenario_idx]
-        logging.info(f"Updating edge capacities on D-{scenario_idx} of recovery...")
+    for day_idx, (scenario_id, event_day) in enumerate(zip(scenarios, conditions)):
+        logging.info(f"Rerouting Analysis on Scenario-{scenario_id} of recovery...")
+        logging.info(f"Updating edge capacities on D-{event_day} of recovery...")
         road_links["acc_capacity"] = road_links["current_capacity"]
         road_links["acc_capacity"] = road_links.apply(
             lambda row: (
                 bridge_recovery(
-                    scenario_idx,
+                    day_idx,
                     row["damage_level_max"],
                     row["current_capacity"],
                     row["acc_capacity"],
@@ -355,7 +357,7 @@ def main(
                 if row["road_label"] == "bridge"
                 else (
                     ordinary_road_recovery(
-                        scenario_idx,
+                        day_idx,
                         row["damage_level_max"],
                         row["current_capacity"],
                         row["acc_capacity"],
@@ -502,8 +504,8 @@ def main(
 
         # Run flow model
         logging.info("Running flow simulation...")
-        isolation_path = out_path / f"trip_isolations_{scenario_idx}.pq"
-        odpfc_path_iter = out_path / f"odpfc_{scenario_idx}.pq"
+        isolation_path = out_path / f"trip_isolations_{scenario_id}.pq"
+        odpfc_path_iter = out_path / f"odpfc_{scenario_id}.pq"
         valid_road_links, (post_time, post_operate, post_toll, total_post_cost) = func.network_flow_model(
             valid_road_links,  # update this one
             network,
@@ -531,13 +533,13 @@ def main(
             f"The total travel costs after disruption: $ million {total_post_cost/ 1e6}"
         )
         logging.info(
-            f"The rerouting cost for scenario {scenario_idx}: $ million {rerouting_cost / 1e6}"
+            f"The rerouting cost for scenario {scenario_id}: $ million {rerouting_cost / 1e6}"
         )
 
         logging.info("Saving results to disk...")
 
         # rerouting costs
-        cDict[scenario_idx] = [rer_time, rer_operate, rer_toll, rerouting_cost]
+        cDict[scenario_id] = [rer_time, rer_operate, rer_toll, rerouting_cost]
         cost_df = pd.DataFrame.from_dict(
             cDict,
             orient="index",
@@ -546,7 +548,7 @@ def main(
         cost_df.rename(columns={"index": "scenario"}, inplace=True)
         cost_df["direct_damage_total"] = direct_damage_total
         cost_df["combined_total_cost"] = cost_df["rerouting_cost"] + cost_df["direct_damage_total"]
-        cost_df.to_csv(out_path / f"rerouting_cost_{scenario_idx}.csv", index=False)
+        cost_df.to_csv(out_path / f"rerouting_cost_{scenario_id}.csv", index=False)
 
         # trip isolations
         if isolation_path.exists():
@@ -561,7 +563,7 @@ def main(
             & (isolation_df.Car21 > 0)
         ].reset_index(drop=True)
         isolation_df.to_csv(
-            out_path / f"trip_isolations_{scenario_idx}.csv",
+            out_path / f"trip_isolations_{scenario_id}.csv",
             index=False,
         )
 
@@ -593,7 +595,7 @@ def main(
         road_links.loc[updated_acc_flow.index, "acc_flow"] = updated_acc_flow.to_numpy(dtype=float)
         road_links = road_links.reset_index()
         road_links["change_flow"] = road_links["acc_flow"] - road_links["current_flow"]
-        road_links.to_parquet(out_path / f"edge_flows_{scenario_idx}.gpq")
+        road_links.to_parquet(out_path / f"edge_flows_{scenario_id}.gpq")
 
         # reset road_links for next scenario
         road_links = road_links[initial_road_links_cols]

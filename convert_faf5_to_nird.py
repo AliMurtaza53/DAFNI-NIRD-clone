@@ -23,7 +23,7 @@ from pathlib import Path
 import fiona
 
 
-# Road classification mapping: FAF5 Class -> NIRD road_classification
+# Road classification mapping: FAF5 Class -> NIRD coarse road_classification
 CLASS_MAPPING = {
     1: 'motorway',           # Interstate
     2: 'trunk',              # Principal Arterial - Freeways
@@ -37,6 +37,31 @@ CLASS_MAPPING = {
     19: 'service',           # Facility Access/Circulator
     50: 'centroid_connector' # Centroid connector (will be filtered)
 }
+
+# Detailed FAF5 road-class labels for reporting / plotting.
+# These are preserved separately from the coarse NIRD categories above.
+DETAIL_CLASS_MAPPING = {
+    1: 'Interstate',
+    2: 'Principal Arterial - Freeways and Expressways',
+    3: 'Principal Arterial - Other',
+    4: 'Minor Arterial',
+    5: 'Major Collector',
+    6: 'Minor Collector',
+    7: 'Local',
+    8: 'Ramp',
+    9: 'Service/Frontage Road',
+    19: 'Facility Access/Circulator',
+    50: 'Centroid Connector',
+}
+
+
+def _clean_label(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == '' or text.lower() in {'nan', 'none', 'null'}:
+        return None
+    return text
 
 # Default parameters if missing in FAF5 data
 DEFAULTS = {
@@ -279,14 +304,30 @@ def convert_faf5_links_to_nird(faf5_links, target_crs='EPSG:2163', filter_centro
         nird_links['length'] = nird_links.geometry.length
     print(f"  ✓ length: {nird_links['length'].min():.1f} to {nird_links['length'].max():.1f} meters")
     
-    # 5. Road classification - map from Class code
+    # 5. Road classification - preserve both coarse and detailed labels
     if 'Class' in faf5_links.columns:
-        nird_links['road_classification'] = faf5_links['Class'].map(CLASS_MAPPING)
-        # Fill any unmapped values with 'unclassified'
-        nird_links['road_classification'] = nird_links['road_classification'].fillna('unclassified')
+        nird_links['road_classification_coarse'] = faf5_links['Class'].map(CLASS_MAPPING)
+        nird_links['road_classification_coarse'] = nird_links['road_classification_coarse'].fillna('unclassified')
+
+        detailed_from_desc = None
+        if 'Class_Description' in faf5_links.columns:
+            detailed_from_desc = faf5_links['Class_Description'].map(_clean_label)
+
+        detailed_from_class = faf5_links['Class'].map(DETAIL_CLASS_MAPPING)
+        detailed = detailed_from_desc if detailed_from_desc is not None else detailed_from_class
+        if detailed_from_desc is not None:
+            detailed = detailed.fillna(detailed_from_class)
+
+        nird_links['road_classification_detail'] = detailed.fillna(nird_links['road_classification_coarse'])
     else:
-        nird_links['road_classification'] = 'unclassified'
-    print(f"  ✓ road_classification: {nird_links['road_classification'].nunique()} types")
+        nird_links['road_classification_coarse'] = 'unclassified'
+        nird_links['road_classification_detail'] = 'unclassified'
+
+    # Keep the historical column name for downstream compatibility.
+    nird_links['road_classification'] = nird_links['road_classification_coarse']
+
+    print(f"  ✓ road_classification_coarse: {nird_links['road_classification_coarse'].nunique()} types")
+    print(f"  ✓ road_classification_detail: {nird_links['road_classification_detail'].nunique()} types")
     
     # 6. Lanes - take maximum of both directions
     if 'AB_Lanes' in faf5_links.columns and 'BA_Lanes' in faf5_links.columns:

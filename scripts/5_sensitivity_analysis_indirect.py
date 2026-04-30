@@ -131,7 +131,13 @@ for depth_key in [15, 30, 60]:
                         df["depth_thres"] = depth_key
                         # only keep edges with rerouting cost > 0
                         df = df[df.rerouting_cost > 0].reset_index(drop=True)
-                        df = df[cols]
+                        cols_available = [c for c in cols if c in df.columns]
+                        missing_cols = [c for c in cols if c not in df.columns]
+                        if missing_cols:
+                            print(
+                                f"Depth: {depth_key}, Event: {event_key}, File: {file} missing columns: {missing_cols}"
+                            )
+                        df = df[cols_available]
                         print(
                             f"Depth: {depth_key}, Event: {event_key}, File: {file}"
                             f" Rows: {len(df)} Completed."
@@ -144,7 +150,15 @@ for depth_key in [15, 30, 60]:
                         gc.collect()
 
 # %%
-edges = pd.read_parquet(path / "edges_revised.pq")
+edges_path = path / "edges_revised.pq"
+if edges_path.exists():
+    edges = pd.read_parquet(edges_path)
+else:
+    print(f"Cached edges file not found at {edges_path}. Using in-memory edges collected from rerouting files.")
+    if edges.empty:
+        print("No rerouting edges were collected. Skipping sensitivity analysis.")
+        sys.exit(0)
+    edges.to_parquet(edges_path)
 
 # Sensitivity analysis using Morris method
 road_classification_mapping = {
@@ -387,9 +401,7 @@ plt.grid(True, linestyle="--", alpha=0.6)
 plt.legend(handles=handles, loc="lower right", borderaxespad=0.5)
 
 plt.tight_layout()
-plt.savefig(
-    r"C:\Oxford\Research\DAFNI\local\papers\figures\for revision\morris_indirect.tif",
-    dpi=300,
-    bbox_inches="tight",
-)
+out_dir = res_path / "figures" / "scenario5"
+out_dir.mkdir(parents=True, exist_ok=True)
+plt.savefig(out_dir / "morris_indirect.tif", dpi=300, bbox_inches="tight")
 plt.show()

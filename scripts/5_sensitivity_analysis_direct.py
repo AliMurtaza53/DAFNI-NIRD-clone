@@ -425,22 +425,10 @@ plt.show()
 
 # %%
 # Data
-parameters = [
-    "Road Length",
-    "Road Classification",
-    "Carriageway Type",
-    "Location",
-    "Lanes",
-    "Road Width",
-    "Structure",
-    "Flood Type",
-    "Flood Depth",
-    "Damage Level",
-    "Damage Ratio",
-    "Unit Asset Value",
-]
-S1_abs = res_df["S1_abs"].values.tolist() / res_df["S1_abs"].values.sum()  # normalize
-ST = res_df["ST"].values.tolist()
+parameters = res_df["Parameters"].tolist()
+S1_abs = res_df["S1_abs"].to_numpy(dtype=float)
+S1_abs = S1_abs / S1_abs.sum() if S1_abs.sum() else S1_abs
+ST = res_df["ST"].to_numpy(dtype=float)
 
 # Create scatter plot
 plt.figure(figsize=(6, 5))
@@ -512,23 +500,10 @@ plt.rcParams["legend.fontsize"] = 14
 
 
 # Parameters for DIRECT damages
-parameters = [
-    "Road Length",
-    "Road Classification",
-    "Carriageway Type",
-    "Location",
-    "Lanes",
-    "Road Width",
-    "Structure",
-    "Flood Type",
-    "Flood Depth",
-    #  "Damage Level",
-    "Damage Ratio",
-    "Unit Asset Value",
-]
-
-S1_abs = res_df["S1_abs"].values / res_df["S1_abs"].values.sum()
-ST = res_df["ST"].values
+parameters = res_df["Parameters"].tolist()
+S1_abs = res_df["S1_abs"].to_numpy(dtype=float)
+S1_abs = S1_abs / S1_abs.sum() if S1_abs.sum() else S1_abs
+ST = res_df["ST"].to_numpy(dtype=float)
 
 plt.figure(figsize=(6.5, 6))
 handles = []
@@ -555,10 +530,7 @@ plt.grid(True, linestyle="--", alpha=0.6)
 # plt.legend(handles=handles, loc="lower right", borderaxespad=0.5)
 
 plt.tight_layout()
-plt.savefig(
-    # r"C:\Oxford\Research\DAFNI\local\papers\figures\for revision\morris_direct.tif",
-    r"C:\Oxford\Research\DAFNI\local\papers\figures\for revision\morris_direct_severe.tif",
-    dpi=300,
-    bbox_inches="tight",
-)
+out_dir = res_path / "figures" / "scenario5"
+out_dir.mkdir(parents=True, exist_ok=True)
+plt.savefig(out_dir / "morris_direct_severe.tif", dpi=300, bbox_inches="tight")
 plt.show()
