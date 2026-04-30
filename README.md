@@ -32,14 +32,31 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
    micromamba activate nird
    ```
 
-3. **Download data files** (see [data/README.md](data/README.md) for details):
+3. **Download and organize data:**
    
-   Download these files from the SharePoint folder and place them in the `data/` directory:
-   - `data/study_area/` – Fairfax boundary (`.geojson` and `.gpkg`)
-   - `data/networks/faf5/` – FAF5 road network (`.gpq`)
-   - `data/od_data/` – OD flow matrices (`.pq` and `.csv`)
+   Download the `fairfax_soge_clusters_toy` folder from SharePoint and place it in the repository as `data/fairfax_soge_clusters_toy/`:
    
    **SharePoint Link**: https://gmuedu-my.sharepoint.com/:f:/g/personal/akothaw_gmu_edu/IgDwyAa9TnQPSKJgzQi9Yyg8AVapqPIeV1wXE9celn7V1Nk?e=81agxV
+   
+   After download, your folder structure should look like:
+   ```
+   DAFNI-NIRD/
+   ├── data/
+   │   └── fairfax_soge_clusters_toy/
+   │       ├── study_area/
+   │       ├── inputs/
+   │       │   ├── networks/faf5/
+   │       │   └── census_datasets/
+   │       ├── hazards/
+   │       ├── parameters/
+   │       ├── damage_curves/
+   │       ├── asset_costs/
+   │       └── dbs/
+   ├── config.json (already configured)
+   └── ...
+   ```
+   
+   For full details on data files, see [data/README.md](data/README.md).
 
 4. **Prepare network (one-time):**
    ```bash
@@ -67,7 +84,7 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
 ```
 1. Data Preparation
    ├─ convert_faf5_to_nird.py
-   │  └─ Input: FAF5 GeoDataFrame (data/networks/faf5/)
+   │  └─ Input: FAF5 GeoDataFrame (data/fairfax_soge_clusters_toy/inputs/networks/faf5/)
    │     Output: NIRD road links/nodes (parquet files)
    │
 2. Network Analysis (Scripts 1–5)
@@ -106,20 +123,25 @@ All input data files are documented in [data/README.md](data/README.md):
 
 ### Configuration
 
-Edit `config.json` to customize:
-- Study area boundary path
-- Network input/output paths
-- Hazard and damage parameters
-- Output directory paths
+The `config.json` file is **pre-configured** with relative paths:
 
-Example:
 ```json
 {
-  "study_area_boundary": "data/study_area/fairfax_study_area.gpkg",
-  "faf5_network_path": "data/networks/faf5/faf5_road_links.gpq",
-  "output_dir": "results"
+  "paths": {
+    "soge_clusters": "data/fairfax_soge_clusters_toy",
+    "base_path": "data/fairfax_soge_clusters_toy",
+    "output_path": "results"
+  }
 }
 ```
+
+All scripts read from these paths automatically. **You only need to customize `config.json` if:**
+- You store data in a different location (e.g., OneDrive symlink)
+- You want output saved elsewhere instead of `results/`
+
+If you need to modify paths, edit the `paths` section with either:
+- **Relative paths**: `data/fairfax_soge_clusters_toy` (recommended; relative to repo root)
+- **Absolute paths**: `/Users/your_name/path/to/fairfax_soge_clusters_toy` (not portable; use only if necessary)
 
 ---
 
@@ -198,14 +220,21 @@ Use the notebook and the two README files in this repository instead:
 Ensure the `data/` directory structure matches exactly (case-sensitive paths):
 ```
 data/
-├── study_area/
-│   ├── fairfax_study_area.geojson
-│   └── fairfax_study_area.gpkg
-├── networks/faf5/
-│   └── faf5_road_links.gpq
-└── od_data/
-    ├── faf5_od_matrix.pq
-    └── faf5_od_node_mapping.csv
+└── fairfax_soge_clusters_toy/
+    ├── study_area/
+    │   ├── fairfax_study_area.geojson
+    │   └── fairfax_study_area.gpkg
+    ├── inputs/
+    │   ├── networks/faf5/
+    │   │   └── faf5_road_links.gpq
+    │   └── census_datasets/
+    │       ├── faf5_od_matrix.pq
+    │       └── faf5_od_node_mapping.csv
+    ├── hazards/
+    ├── parameters/
+    ├── damage_curves/
+    ├── asset_costs/
+    └── dbs/
 ```
 
 ### Script Errors
@@ -238,9 +267,16 @@ jupyter nbconvert --to notebook --execute scripts/visualize_pipeline_results.ipy
 DAFNI-NIRD/
 ├── data/                          # Input data (download from SharePoint)
 │   ├── README.md                  # Data documentation & setup guide
-│   ├── study_area/                # Boundary for clipping
-│   ├── networks/faf5/             # FAF5 road network
-│   └── od_data/                   # OD flow matrices
+│   └── fairfax_soge_clusters_toy/ # Main data directory
+│       ├── study_area/            # Boundary for clipping
+│       ├── inputs/
+│       │   ├── networks/faf5/     # FAF5 road network
+│       │   └── census_datasets/   # OD flow matrices
+│       ├── hazards/               # Flood depth scenarios
+│       ├── parameters/            # Model parameters
+│       ├── damage_curves/         # Asset damage curves
+│       ├── asset_costs/           # Asset cost data
+│       └── dbs/                   # Database files
 ├── src/nird/                      # Python package with analysis functions
 │   ├── utils.py                   # Config loading, helpers
 │   ├── road_revised.py            # Network flow model
@@ -257,8 +293,7 @@ DAFNI-NIRD/
 │   └── visualize_pipeline_results.ipynb
 ├── convert_faf5_to_nird.py        # FAF5 → NIRD network converter
 ├── convert_faf5_od_to_nird.py     # FAF5 OD → NIRD OD converter (variant)
-├── config.json                    # Pipeline configuration
-├── configs.json                   # Alternative configuration format
+├── config.json                    # Pipeline configuration (pre-configured)
 ├── environment.yaml               # Conda environment specification
 ├── pyproject.toml                 # Python package metadata
 ├── README.md                      # This file

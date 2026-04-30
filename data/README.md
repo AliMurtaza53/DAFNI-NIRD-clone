@@ -44,51 +44,53 @@ https://gmuedu-my.sharepoint.com/:f:/g/personal/akothaw_gmu_edu/IgDwyAa9TnQPSKJg
 
 ## Setup Instructions
 
-### Step 1: Create Data Directories
+### Step 1: Download Data from SharePoint
 
-After cloning this repository, create the following directory structure:
+Access the shared SharePoint folder (link above) and download the entire **`fairfax_soge_clusters_toy`** folder:
+
+```
+https://gmuedu-my.sharepoint.com/:f:/g/personal/akothaw_gmu_edu/IgDwyAa9TnQPSKJgzQi9Yyg8AVapqPIeV1wXE9celn7V1Nk?e=81agxV
+```
+
+### Step 2: Organize Data in Repository
+
+After downloading, place the folder in your local repository:
 
 ```bash
 cd DAFNI-NIRD
-mkdir -p data/study_area
-mkdir -p data/networks/faf5
-mkdir -p data/od_data
+# Copy the downloaded folder into the data directory
+cp -r /path/to/fairfax_soge_clusters_toy data/
 ```
 
-### Step 2: Download Data from SharePoint
-
-Access the shared SharePoint folder (link above) and download:
+The final structure should look like:
 
 ```
-study_area/
-├── fairfax_study_area.geojson
-└── fairfax_study_area.gpkg
-
-networks/
-└── faf5/
-    └── faf5_road_links.gpq
-
-od_data/
-├── faf5_od_matrix.pq
-└── faf5_od_node_mapping.csv
+DAFNI-NIRD/
+├── data/
+│   └── fairfax_soge_clusters_toy/          # Downloaded from SharePoint
+│       ├── study_area/
+│       │   ├── fairfax_study_area.geojson
+│       │   └── fairfax_study_area.gpkg
+│       ├── inputs/
+│       │   ├── networks/
+│       │   │   └── faf5/
+│       │   │       └── faf5_road_links.gpq
+│       │   └── census_datasets/
+│       │       ├── faf5_od_matrix.pq
+│       │       └── faf5_od_node_mapping.csv
+│       ├── hazards/
+│       ├── parameters/
+│       ├── damage_curves/
+│       ├── asset_costs/
+│       ├── dbs/
+│       └── graphics/
+├── config.json                              # Points to data/fairfax_soge_clusters_toy
+├── environment.yaml
+├── scripts/
+└── ...
 ```
 
-### Step 3: Organize Locally
-
-Place downloaded files in the matching local directory structure:
-
-```
-data/
-├── study_area/
-│   ├── fairfax_study_area.geojson
-│   └── fairfax_study_area.gpkg
-├── networks/
-│   └── faf5/
-│       └── faf5_road_links.gpq
-└── od_data/
-    ├── faf5_od_matrix.pq
-    └── faf5_od_node_mapping.csv
-```
+**Note**: The scripts automatically look for all required subdirectories under `fairfax_soge_clusters_toy/`. You don't need to reorganize—just download and place the folder as-is.
 
 ### Step 4: Verify Data
 

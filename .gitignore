@@ -121,3 +121,8 @@ test_outputs
 *.csv
 *.png
 _plottings*
+_plottings*
+
+# Project-specific: Data and outputs (user-specific, should not be committed)
+data/
+results/
