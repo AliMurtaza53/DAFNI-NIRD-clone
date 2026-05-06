@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 from typing import Dict, Optional
 from pathlib import Path
 
@@ -24,6 +25,15 @@ warnings.filterwarnings("ignore")
 base_path = Path(load_config()["paths"]["soge_clusters"])
 raster_path = base_path / "hazards" / "completed"
 TARGET_CRS = "EPSG:2163"  # US National Atlas Equal Area (use for USA networks)
+
+# Optional performance controls (disabled by default)
+SPLIT_SIMPLIFY_TOLERANCE_M = float(os.environ.get("NIRD_SPLIT_SIMPLIFY_TOLERANCE_M", "0"))
+ENABLE_SPLIT_CACHE = os.environ.get("NIRD_ENABLE_SPLIT_CACHE", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+_SPLIT_CACHE = {}
 
 
 def configure_proj_runtime() -> Optional[Path]:
@@ -244,8 +254,38 @@ def intersect_features_with_raster(
             transform=tuple(window_transform)[:6],
         )
 
-    intersections = intersection.split_linestrings(prepared, grid)
-    intersections = intersection.apply_indices(intersections, grid)
+    if SPLIT_SIMPLIFY_TOLERANCE_M > 0:
+        prepared = prepared.copy()
+        prepared["geometry"] = prepared.geometry.simplify(
+            SPLIT_SIMPLIFY_TOLERANCE_M,
+            preserve_topology=True,
+        )
+
+    cache_key = None
+    intersections = None
+    if ENABLE_SPLIT_CACHE and "e_id" in prepared.columns:
+        try:
+            eids = prepared["e_id"].astype(str).tolist()
+            cache_key = (
+                tuple(sorted(eids)),
+                grid.crs,
+                grid.width,
+                grid.height,
+                tuple(grid.transform),
+                round(float(SPLIT_SIMPLIFY_TOLERANCE_M), 6),
+            )
+            cached = _SPLIT_CACHE.get(cache_key)
+            if cached is not None:
+                intersections = cached.copy()
+        except Exception:
+            cache_key = None
+
+    if intersections is None:
+        intersections = intersection.split_linestrings(prepared, grid)
+        intersections = intersection.apply_indices(intersections, grid)
+        if cache_key is not None:
+            _SPLIT_CACHE[cache_key] = intersections.copy()
+
     intersections[f"flood_depth_{flood_type}"] = (
         intersection.get_raster_values_for_splits(intersections, raster)
     )
@@ -534,6 +574,122 @@ def compute_damage_level_on_flooded_roads(
         logging.info("Please enter the type of flood!")
 
 
+def compute_damage_levels_on_flooded_roads_vectorized(
+    fldType: str,
+    road_classification: pd.Series,
+    trunk_road: pd.Series,
+    road_label: pd.Series,
+    fldDepth: pd.Series,
+) -> pd.Series:
+    """Vectorized equivalent of compute_damage_level_on_flooded_roads()."""
+
+    depth_cm = pd.to_numeric(fldDepth, errors="coerce") * 100.0
+    rc_raw = road_classification.fillna("").astype(str).str.strip()
+    rc_lower = rc_raw.str.lower()
+    trunk_flag = (
+        pd.Series(trunk_road, index=rc_raw.index)
+        .fillna(False)
+        .astype(str)
+        .str.lower()
+        .isin({"true", "1", "yes"})
+    )
+    road_label = pd.Series(road_label, index=rc_raw.index).fillna("").astype(str)
+
+    faf_us_classes = {
+        "motorway",
+        "motorway_link",
+        "trunk",
+        "primary",
+        "secondary",
+        "tertiary",
+        "service",
+        "unclassified",
+    }
+    major_faf = rc_lower.isin({"motorway", "motorway_link", "trunk", "primary", "secondary"})
+    faf_mask = rc_lower.isin(faf_us_classes)
+    uk_major = rc_raw.eq("Motorway") | (rc_raw.eq("A Road") & trunk_flag)
+    tunnel_mask = road_label.eq("tunnel")
+
+    result = pd.Series(np.nan, index=rc_raw.index, dtype=object)
+
+    if fldType == "surface":
+        # FAF/US classifications
+        faf_major_mask = faf_mask & major_faf
+        faf_minor_mask = faf_mask & ~major_faf
+        result.loc[faf_major_mask & (depth_cm < 200)] = "no"
+        result.loc[faf_major_mask & (depth_cm >= 200) & (depth_cm < 600)] = "minor"
+        result.loc[faf_major_mask & (depth_cm >= 600)] = "moderate"
+
+        result.loc[faf_minor_mask & (depth_cm < 50)] = "no"
+        result.loc[faf_minor_mask & (depth_cm >= 50) & (depth_cm < 600)] = "minor"
+        result.loc[faf_minor_mask & (depth_cm >= 600)] = "moderate"
+
+        # UK legacy classifications
+        uk_tunnel = ~faf_mask & uk_major & tunnel_mask
+        uk_major_notunnel = ~faf_mask & uk_major & ~tunnel_mask
+        uk_other = ~faf_mask & ~uk_major
+
+        result.loc[uk_tunnel & (depth_cm < 50)] = "no"
+        result.loc[uk_tunnel & (depth_cm >= 50) & (depth_cm < 100)] = "minor"
+        result.loc[uk_tunnel & (depth_cm >= 100) & (depth_cm < 200)] = "moderate"
+        result.loc[uk_tunnel & (depth_cm >= 200) & (depth_cm < 600)] = "extensive"
+        result.loc[uk_tunnel & (depth_cm >= 600)] = "severe"
+
+        result.loc[uk_major_notunnel & (depth_cm < 50)] = "no"
+        result.loc[uk_major_notunnel & (depth_cm >= 50) & (depth_cm < 100)] = "no"
+        result.loc[uk_major_notunnel & (depth_cm >= 100) & (depth_cm < 200)] = "no"
+        result.loc[uk_major_notunnel & (depth_cm >= 200) & (depth_cm < 600)] = "minor"
+        result.loc[uk_major_notunnel & (depth_cm >= 600)] = "moderate"
+
+        result.loc[uk_other & (depth_cm < 50)] = "no"
+        result.loc[uk_other & (depth_cm >= 50) & (depth_cm < 100)] = "no"
+        result.loc[uk_other & (depth_cm >= 100) & (depth_cm < 200)] = "minor"
+        result.loc[uk_other & (depth_cm >= 200) & (depth_cm < 600)] = "minor"
+        result.loc[uk_other & (depth_cm >= 600)] = "moderate"
+
+    elif fldType == "river":
+        faf_major_mask = faf_mask & major_faf
+        faf_minor_mask = faf_mask & ~major_faf
+
+        result.loc[faf_major_mask & (depth_cm < 50)] = "no"
+        result.loc[faf_major_mask & (depth_cm >= 50) & (depth_cm < 100)] = "minor"
+        result.loc[faf_major_mask & (depth_cm >= 100) & (depth_cm < 200)] = "moderate"
+        result.loc[faf_major_mask & (depth_cm >= 200) & (depth_cm < 600)] = "extensive"
+        result.loc[faf_major_mask & (depth_cm >= 600)] = "severe"
+
+        result.loc[faf_minor_mask & (depth_cm <= 0)] = "no"
+        result.loc[faf_minor_mask & (depth_cm > 0) & (depth_cm < 50)] = "minor"
+        result.loc[faf_minor_mask & (depth_cm >= 50) & (depth_cm < 200)] = "moderate"
+        result.loc[faf_minor_mask & (depth_cm >= 200) & (depth_cm < 600)] = "extensive"
+        result.loc[faf_minor_mask & (depth_cm >= 600)] = "severe"
+
+        uk_tunnel = ~faf_mask & uk_major & tunnel_mask
+        uk_major_notunnel = ~faf_mask & uk_major & ~tunnel_mask
+        uk_other = ~faf_mask & ~uk_major
+
+        result.loc[uk_tunnel & (depth_cm < 50)] = "no"
+        result.loc[uk_tunnel & (depth_cm >= 50) & (depth_cm < 100)] = "minor"
+        result.loc[uk_tunnel & (depth_cm >= 100) & (depth_cm < 200)] = "minor"
+        result.loc[uk_tunnel & (depth_cm >= 200) & (depth_cm < 600)] = "moderate"
+        result.loc[uk_tunnel & (depth_cm >= 600)] = "extensive"
+
+        result.loc[uk_major_notunnel & (depth_cm < 50)] = "no"
+        result.loc[uk_major_notunnel & (depth_cm >= 50) & (depth_cm < 100)] = "minor"
+        result.loc[uk_major_notunnel & (depth_cm >= 100) & (depth_cm < 200)] = "moderate"
+        result.loc[uk_major_notunnel & (depth_cm >= 200) & (depth_cm < 600)] = "extensive"
+        result.loc[uk_major_notunnel & (depth_cm >= 600)] = "severe"
+
+        result.loc[uk_other & (depth_cm <= 0)] = "no"
+        result.loc[uk_other & (depth_cm > 0) & (depth_cm < 50)] = "minor"
+        result.loc[uk_other & (depth_cm >= 50) & (depth_cm < 200)] = "moderate"
+        result.loc[uk_other & (depth_cm >= 200) & (depth_cm < 600)] = "extensive"
+        result.loc[uk_other & (depth_cm >= 600)] = "severe"
+    else:
+        logging.info("Please enter the type of flood!")
+
+    return result
+
+
 def intersections_with_damage(
     road_links: gpd.GeoDataFrame,
     flood_key: str,
@@ -590,15 +746,12 @@ def intersections_with_damage(
         ).clip(lower=0)
 
     # Compute damage levels for flooded road segments
-    intersections[f"damage_level_{flood_type}"] = intersections.apply(
-        lambda row: compute_damage_level_on_flooded_roads(
-            flood_type,
-            row["road_classification"],
-            row.get("trunk_road"),  # Will be None for FAF data
-            row.get("road_label"),  # Will be None for FAF data
-            row[f"flood_depth_{flood_type}"],
-        ),
-        axis=1,
+    intersections[f"damage_level_{flood_type}"] = compute_damage_levels_on_flooded_roads_vectorized(
+        flood_type,
+        intersections["road_classification"],
+        intersections["trunk_road"] if "trunk_road" in intersections.columns else pd.Series(False, index=intersections.index),
+        intersections["road_label"] if "road_label" in intersections.columns else pd.Series("", index=intersections.index),
+        intersections[f"flood_depth_{flood_type}"],
     )
 
     return intersections
@@ -697,6 +850,17 @@ def main(depth_key, event_key):
     """
     Main function to perform disruption analysis on road networks under flood scenarios.
 
+    Parameters:
+        depth_key (int): Flood depth threshold in centimeters for road closure.
+                        Determines when roads become impassable. Common values: 15, 30, 60 cm.
+                        Controls the speed reduction curve for flooded roads.
+        event_key (str): Scenario identifier for flood event.
+                For the Fairfax toy dataset use:
+                - '1' = base
+                - '2' = low
+                - '3' = high
+                Used to locate hazard rasters and organize outputs.
+
     Model Inputs:
         - edge_flows_32p.gpq:
             Base scenario output containing road network simulation results.
@@ -714,23 +878,27 @@ def main(depth_key, event_key):
             GeoDataFrame of road links with aggregated maximum flood depth and
                 damage levels.
 
-    Parameters:
-        depth_thres (int): Flood depth threshold in centimeters for road closure.
-
     Returns:
         None: Outputs are saved to files.
     """
     # Normalize event key so calls from CLI and direct Python are consistent
     event_key = str(event_key).strip()
+    logging.info(f"[MAIN START] depth_key={depth_key} cm, event_key={event_key}")
 
     # base scenario simulation results
-    base_scenario_links = gpd.read_parquet(
+    base_scenario_path = (
         base_path.parent
         / "results"
         / "base_scenario"
         / get_results_variant()
         / "edge_flows.gpq"
     )
+    logging.info(f"[LOAD] Loading base scenario from {base_scenario_path}")
+    print(f"DEBUG: Loading {base_scenario_path} (exists={base_scenario_path.exists()})")
+    base_scenario_links = gpd.read_parquet(base_scenario_path)
+    logging.info(f"[LOAD] Base scenario loaded: {len(base_scenario_links)} rows")
+    print(f"DEBUG: Base scenario shape={base_scenario_links.shape}")
+    
     # Remove duplicate columns if they exist
     base_scenario_links = base_scenario_links.loc[:, ~base_scenario_links.columns.duplicated()]
 
@@ -801,13 +969,23 @@ def main(depth_key, event_key):
         try:
             event_key_num = int(event_key)
         except (TypeError, ValueError):
-            event_key_num = 1
+            raise ValueError(
+                "In toy mode, event_key must be one of: 1 (base), 2 (low), 3 (high)"
+            )
 
-        toy_variant = {1: "base", 2: "low", 3: "high"}.get(event_key_num, "base")
+        toy_variant_map = {1: "base", 2: "low", 3: "high"}
+        if event_key_num not in toy_variant_map:
+            raise ValueError(
+                f"Invalid toy-mode event_key={event_key_num}. Use 1=base, 2=low, 3=high."
+            )
+
+        toy_variant = toy_variant_map[event_key_num]
         selected_tif = first_existing(
             [toy_hazard_dir / f"fairfax_hazard_class50_17node_{toy_variant}.tif", toy_hazard_path]
         )
-        logging.info(f"Toy hazard raster mode enabled with: {selected_tif}")
+        logging.info(
+            f"Toy hazard raster mode enabled: event_key={event_key_num} ({toy_variant}) -> {selected_tif}"
+        )
 
         # In toy mode, use the same raster for both surface and river so the downstream
         # damage analysis still sees both expected depth columns.
@@ -888,13 +1066,17 @@ def main(depth_key, event_key):
                     event_dict[event][flood_type].append(event_path)
 
     # analysis
+    logging.info(f"[ANALYSIS] Found {len(event_dict)} flood events, filtering for event_key={event_key}")
+    print(f"DEBUG: event_dict keys={list(event_dict.keys())}")
+    
+    processed_event = False
     for flood_key, v in event_dict.items():
         if flood_key != event_key:
+            logging.info(f"[SKIP] Skipping flood_key={flood_key} (not matching event_key={event_key})")
             continue
-        print(f"Starting intersection for event {flood_key}...")
-        # load road links (SUBNETWORK)
-        road_links = gpd.read_parquet(road_links_path)
-
+        processed_event = True
+        logging.info(f"[PROCESS] Starting intersection analysis for flood_key={flood_key}")
+        print(f"DEBUG: Starting intersection for event {flood_key}...")
         # out path
         out_path = (
             base_path.parent
@@ -903,19 +1085,28 @@ def main(depth_key, event_key):
             / get_results_variant()
             / str(depth_key)
         )
+        logging.info(f"[PATHS] Output directory: {out_path}")
+        print(f"DEBUG: Output path={out_path}")
         
         # Load road links once outside the loop for efficiency
-        road_links_base = gpd.read_parquet(road_links_path)
+        # load road links (SUBNETWORK)
+        road_links = gpd.read_parquet(road_links_path)
+        logging.info(f"[LOAD] Road links loaded for event {flood_key}: {len(road_links)} rows")
 
         intersections = gpd.GeoDataFrame(
             columns=["e_id", "length", "index_i", "index_j"]
         )
 
         for flood_type, flood_paths in v.items():
+            logging.info(f"[FLOOD_TYPE] Processing flood_type={flood_type} with {len(flood_paths)} files")
+            print(f"DEBUG: Processing {flood_type} with {len(flood_paths)} rasters")
             # Use a fresh copy for each flood type to avoid accumulated columns
-            road_links_fresh = road_links_base.copy()
+            road_links_fresh = road_links.copy()
             
             for flood_path in flood_paths:
+                logging.info(f"[RASTER] Processing raster: {flood_path}")
+                print(f"DEBUG: Processing raster {Path(flood_path).name}")
+                
                 if toy_hazard_path is not None:
                     clip_path = toy_clip_path
                 else:
@@ -930,10 +1121,13 @@ def main(depth_key, event_key):
                     elif clip_path2.exists():
                         clip_path = clip_path2
                     else:
-                        logging.info(f"Cannot find vector file for: {flood_path}")
+                        logging.info(f"[SKIP] Cannot find vector file for: {flood_path}")
+                        print(f"DEBUG: Missing vector clip file")
                         continue  # Skip further processing for this file
 
                 # intersections
+                logging.info(f"[INTERSECT] Computing intersections for {flood_type}...")
+                raster_start = time.perf_counter()
                 temp_file = intersections_with_damage(
                     road_links_fresh,
                     flood_key,
@@ -943,7 +1137,12 @@ def main(depth_key, event_key):
                     analysis_boundary,
                 )
                 if temp_file is None:
+                    logging.warning(f"[INTERSECT_FAIL] No results from intersections_with_damage")
                     continue
+                raster_elapsed = time.perf_counter() - raster_start
+                logging.info(
+                    f"[INTERSECT_OK] Got {len(temp_file)} intersection results in {raster_elapsed:.2f}s"
+                )
                 intersections = intersections.merge(
                     temp_file[
                         [
@@ -961,23 +1160,27 @@ def main(depth_key, event_key):
 
         # save intersectiosn for damage analysis
         if intersections.empty:
-            logging.info("Warning: intersections result is empty!")
+            logging.warning("[EMPTY] Intersections result is empty! Skipping output.")
+            print("DEBUG: Intersections are empty!")
             continue
 
+        logging.info(f"[SAVE_INTERSECT] Saving {len(intersections)} intersection rows")
         (out_path / "intersections").mkdir(parents=True, exist_ok=True)
         intersections_path = out_path / "intersections" / f"intersections_{flood_key}.pq"
         intersections.to_parquet(intersections_path)
         validate_output(intersections_path, intersections, "intersections")
         log_summary("intersections", intersections)
+        print(f"DEBUG: Saved intersections to {intersections_path}")
 
         # road integrations - reload fresh copy
-        road_links = gpd.read_parquet(road_links_path)
+        logging.info(f"[FEATURES] Computing features_with_damage...")
         road_links = features_with_damage(
             road_links,
             intersections,
             damage_level_dict,
             damage_level_dict_reverse,
         )
+        logging.info(f"[FEATURES_OK] Features computed, {len(road_links)} road links")
 
         # max_speed estimation
         """
@@ -985,6 +1188,7 @@ def main(depth_key, event_key):
         """
         # attach capacity and speed info on D-0
         # Drop duplicate columns if they exist (from previous iterations)
+        logging.info(f"[SPEED] Computing speed restrictions...")
         cols_to_drop = ["combined_label", "free_flow_speeds", "initial_flow_speeds", 
                         "min_flow_speeds", "current_capacity", "current_speed", "current_flow"]
         cols_to_drop = [c for c in cols_to_drop if c in road_links.columns]
@@ -1018,29 +1222,63 @@ def main(depth_key, event_key):
         road_links["free_flow_speeds"] = road_links["free_flow_speeds"].fillna(50.0)
 
         # compute maximum speed restriction on individual road links
-        road_links["max_speed"] = road_links.apply(
-            lambda row: compute_maximum_speed_on_flooded_roads(
-                row["flood_depth_max"],
-                row["free_flow_speeds"],
-                threshold=depth_key,
-            ),
-            axis=1,
+        flood_depth_cm = pd.to_numeric(road_links["flood_depth_max"], errors="coerce") * 100.0
+        free_flow_speed = pd.to_numeric(road_links["free_flow_speeds"], errors="coerce")
+        road_links["max_speed"] = np.where(
+            flood_depth_cm < depth_key,
+            free_flow_speed * ((flood_depth_cm / depth_key - 1) ** 2),
+            0.0,
         )
         (out_path / "links").mkdir(parents=True, exist_ok=True)
         links_path = out_path / "links" / f"road_links_{flood_key}.gpq"
+        logging.info(f"[SAVE_LINKS] Saving {len(road_links)} road links to {links_path}")
         road_links.to_parquet(links_path)
         validate_output(links_path, road_links, "road_links")
         log_summary("road_links", road_links)
+        logging.info(f"[COMPLETE] Script 2 completed successfully for event_key={event_key}, depth_key={depth_key}")
+        print(f"DEBUG: Script 2 COMPLETE! Outputs saved to {out_path}")
+
+    if not processed_event:
+        logging.warning(
+            f"[NO_MATCH] event_key={event_key} not found in discovered events: {list(event_dict.keys())}"
+        )
+        print(f"DEBUG: No matching event_key={event_key}. Available events: {list(event_dict.keys())}")
 
 
 if __name__ == "__main__":
+    import time
+    start_time = time.time()
     logging.basicConfig(
-        format="%(asctime)s %(process)d %(filename)s %(message)s",
+        format="%(asctime)s %(process)d %(filename)s %(levelname)s %(message)s",
         level=logging.INFO,
     )
+    print("="*60)
+    print("SCRIPT 2: Intersection Analysis - STARTING")
+    print("="*60)
     try:  # in bash inputs will be str by default
         depth_key = sys.argv[1]
         event_key = sys.argv[2]
+        print(f"CLI Args: depth_key={depth_key}, event_key={event_key}")
+        logging.info(f"Script 2 starting with depth_key={depth_key}, event_key={event_key}")
         main(int(depth_key), str(event_key))
-    except IndexError or NameError:
-        logging.info("Please enter depth_key and event_key!")
+        elapsed = time.time() - start_time
+        print("="*60)
+        print(f"SCRIPT 2: COMPLETED SUCCESSFULLY in {elapsed:.2f} seconds")
+        print("="*60)
+        logging.info(f"Script 2 completed in {elapsed:.2f} seconds")
+    except IndexError or NameError as e:
+        elapsed = time.time() - start_time
+        error_msg = "Please enter depth_key and event_key!"
+        logging.error(error_msg)
+        print(f"ERROR: {error_msg}")
+        print(f"Usage: python {sys.argv[0]} <depth_key> <event_key>")
+        print(f"  depth_key: flood depth threshold in cm (e.g., 15, 30, 60)")
+        print(f"  event_key (toy dataset): 1=base, 2=low, 3=high")
+        sys.exit(1)
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logging.exception(f"Unexpected error in script 2 after {elapsed:.2f}s")
+        print(f"FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

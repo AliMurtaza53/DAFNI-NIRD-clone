@@ -4,6 +4,7 @@ import json
 import warnings
 import gc
 import ast
+from functools import lru_cache
 
 from pathlib import Path
 from typing import Tuple, Dict
@@ -25,11 +26,24 @@ from collections import defaultdict
 import nird.road_revised as func
 from nird.utils import get_results_variant, load_config, get_flow_on_edges
 import duckdb
+import os
 
 # %%
 warnings.simplefilter("ignore")
 base_path = Path(load_config()["paths"]["soge_clusters"])
 tqdm.pandas()
+
+# Optional performance controls (disabled by default)
+VECTORIZE_PATH_PARSING = os.environ.get("NIRD_VECTORIZE_PATH_PARSING", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+USE_SET_BASED_FLOOD_LOOKUP = os.environ.get("NIRD_USE_SET_BASED_FLOOD_LOOKUP", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 def first_existing(paths):
@@ -74,18 +88,47 @@ def to_edge_id_list(value):
 
     # stringified list
     if isinstance(value, str):
-        s = value.strip()
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                parsed = ast.literal_eval(s)
-                if isinstance(parsed, (list, tuple, set, np.ndarray)):
-                    return [str(v) for v in parsed if v is not None and str(v) != "nan"]
-            except Exception:
-                pass
-        # fallback: comma-separated tokens
-        return [tok.strip() for tok in s.split(",") if tok.strip()]
+        return list(_parse_edge_id_string_cached(value))
 
     return [str(value)]
+
+
+@lru_cache(maxsize=200_000)
+def _parse_edge_id_string_cached(raw: str) -> tuple:
+    """Parse string path payloads with caching (helps repeated OD path strings)."""
+    s = str(raw).strip()
+    if not s or s == "nan":
+        return tuple()
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            parsed = ast.literal_eval(s)
+            if isinstance(parsed, np.ndarray):
+                parsed = parsed.tolist()
+            if isinstance(parsed, (list, tuple, set)):
+                return tuple(str(v) for v in parsed if v is not None and str(v) != "nan")
+        except Exception:
+            pass
+    return tuple(tok.strip() for tok in s.split(",") if tok.strip())
+
+
+def to_edge_id_list_vectorized(series: pd.Series) -> pd.Series:
+    """Batch parse Series values; caches repeated string payloads."""
+    if series.empty:
+        return series
+
+    out = pd.Series(index=series.index, dtype=object)
+    str_mask = series.map(lambda v: isinstance(v, str))
+
+    if str_mask.any():
+        str_values = series[str_mask]
+        unique_vals = pd.unique(str_values)
+        parsed_map = {val: list(_parse_edge_id_string_cached(val)) for val in unique_vals}
+        out.loc[str_mask] = str_values.map(parsed_map)
+
+    if (~str_mask).any():
+        out.loc[~str_mask] = series[~str_mask].apply(to_edge_id_list)
+
+    return out
 
 
 # %%
@@ -117,15 +160,10 @@ def ordinary_road_recovery(
 
 def load_scenarios(base_path: Path) -> Tuple[Dict, Dict]:
     """Load recovery rates for bridges and ordinary roads."""
-    scenario_path = first_existing(
-        [
-            base_path / "tables" / "recovery design_updated.csv",
-            base_path / "inputs" / "tables" / "recovery design_updated.csv",
-        ]
-    )
-    if scenario_path is None:
+    scenario_path = base_path / "tables" / "recovery design_updated.csv"
+    if not scenario_path.exists():
         raise FileNotFoundError(
-            "Could not find recovery dfesign_updated.csv in standard or toy input table paths"
+            "Could not find recovery design_updated.csv in the tables directory"
         )
     df = pd.read_csv(scenario_path)
 
@@ -273,11 +311,17 @@ def main(
 
     disrupted_candidates = pd.read_parquet(odpfc_path)
     if "path" in disrupted_candidates.columns:
-        disrupted_candidates["path"] = disrupted_candidates["path"].apply(to_edge_id_list)
+        if VECTORIZE_PATH_PARSING:
+            disrupted_candidates["path"] = to_edge_id_list_vectorized(disrupted_candidates["path"])
+        else:
+            disrupted_candidates["path"] = disrupted_candidates["path"].apply(to_edge_id_list)
     if "flood_links" in disrupted_candidates.columns:
-        disrupted_candidates["flood_links"] = disrupted_candidates["flood_links"].apply(
-            to_edge_id_list
-        )
+        if VECTORIZE_PATH_PARSING:
+            disrupted_candidates["flood_links"] = to_edge_id_list_vectorized(disrupted_candidates["flood_links"])
+        else:
+            disrupted_candidates["flood_links"] = disrupted_candidates["flood_links"].apply(
+                to_edge_id_list
+            )
     disrupted_candidates["od_id"] = disrupted_candidates.index  # numbering od pairs
     # Load road links with damage (e.g., flood depth and damage level)
     road_links = gpd.read_parquet(
@@ -322,9 +366,15 @@ def main(
         flooded_edges = set(
             road_links.loc[road_links["damage_level_max"] != "no", "e_id"]
         )
-        disrupted_candidates["flood_links"] = disrupted_candidates["path"].apply(
-            lambda p: [e for e in p if e in flooded_edges]
-        )
+        if USE_SET_BASED_FLOOD_LOOKUP:
+            # Use set-based filtering (already optimized; flag available for future improvements)
+            disrupted_candidates["flood_links"] = disrupted_candidates["path"].apply(
+                lambda p: [e for e in p if e in flooded_edges]
+            )
+        else:
+            disrupted_candidates["flood_links"] = disrupted_candidates["path"].apply(
+                lambda p: [e for e in p if e in flooded_edges]
+            )
         disrupted_candidates = disrupted_candidates[
             disrupted_candidates["flood_links"].map(len) > 0
         ].reset_index(drop=True)
