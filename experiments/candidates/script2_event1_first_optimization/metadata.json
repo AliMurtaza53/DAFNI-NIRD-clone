@@ -1,0 +1,8 @@
+{
+  "exp_id": "script2_event1_first_optimization",
+  "branch": "demo/clean-sandbox-reproducible",
+  "commit": "8ff5614",
+  "timestamp": "2026-05-04T18:46:31.263667",
+  "description": "First optimization: remove redundant road_links parquet read in Script 2 event loop",
+  "prof_file": "2_intersection_analysis_depth30_event1_candidate.prof"
+}

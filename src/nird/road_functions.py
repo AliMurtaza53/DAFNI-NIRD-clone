@@ -540,7 +540,7 @@ def compute_damage_values(
     lanes: int,
     road_label: str,
     damage_level: str,
-    damage_values: Dict,  # million £/unit
+    damage_values: Dict,  # million $/unit
     bridge_width=None,
 ) -> Tuple[float, float, float]:
     """
@@ -568,7 +568,7 @@ def compute_damage_values(
     damage_level : str
         The severity level of damage (e.g., "minor", "major", "catastrophic").
     damage_values : dict
-        A nested dictionary containing damage cost values (in million £/unit) for
+        A nested dictionary containing damage cost values (in million $/unit) for
         different infrastructure types,
         flood types, and damage levels. The dictionary should have the structure:
         {

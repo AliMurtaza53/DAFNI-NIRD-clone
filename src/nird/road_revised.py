@@ -1578,9 +1578,9 @@ def network_flow_model(
     conn.close()
 
     logging.info("The flow simulation is completed!")
-    logging.info(f"total travel cost is (£): {total_cost}")
-    logging.info(f"total time-equiv cost is (£): {cost_time}")
-    logging.info(f"total operating cost is (£): {cost_fuel}")
-    logging.info(f"total toll cost is (£): {cost_toll}")
+    logging.info(f"total travel cost is ($): {total_cost}")
+    logging.info(f"total time-equiv cost is ($): {cost_time}")
+    logging.info(f"total operating cost is ($): {cost_fuel}")
+    logging.info(f"total toll cost is ($): {cost_toll}")
 
     return road_links, cList

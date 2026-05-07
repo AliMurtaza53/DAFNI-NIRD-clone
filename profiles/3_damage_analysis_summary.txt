@@ -1,0 +1,3 @@
+Profile summary for scripts/3_damage_analysis.py
+Wall time (s): 47.820
+

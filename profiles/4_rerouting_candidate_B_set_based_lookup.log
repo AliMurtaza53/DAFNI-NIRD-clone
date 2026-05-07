@@ -1,0 +1,225 @@
+2026-05-05 21:59:06,122 45404 4_rerouting_and_recovery_scenario_loop.py Start...
+2026-05-05 21:59:06,123 45404 4_rerouting_and_recovery_scenario_loop.py Database path is: C:\Users\alimu\NIRD_Data\fairfax_soge_clusters_toy\dbs\recovery_30_1.duckdb
+2026-05-05 21:59:09,379 45404 4_rerouting_and_recovery_scenario_loop.py Loaded script-3 damages for event 1: edges=3092, direct_damage_total=15270142.25
+2026-05-05 21:59:09,414 45404 4_rerouting_and_recovery_scenario_loop.py Rerouting Analysis on Scenario-1 of recovery...
+2026-05-05 21:59:09,414 45404 4_rerouting_and_recovery_scenario_loop.py Updating edge capacities on D-0 of recovery...
+2026-05-05 21:59:09,611 45404 4_rerouting_and_recovery_scenario_loop.py Extracting disrupted OD pairs...
+2026-05-05 21:59:09,612 45404 4_rerouting_and_recovery_scenario_loop.py disrupted_od size: 328
+2026-05-05 21:59:09,612 45404 4_rerouting_and_recovery_scenario_loop.py chunk_size: 328
+Processing chunks:   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks: 100%|##########| 1/1 [00:00<00:00, 13.25chunk/s]
+2026-05-05 21:59:09,719 45404 4_rerouting_and_recovery_scenario_loop.py Aggregating final results...
+2026-05-05 21:59:09,726 45404 4_rerouting_and_recovery_scenario_loop.py Completing chunk process...
+2026-05-05 21:59:09,731 45404 4_rerouting_and_recovery_scenario_loop.py The total disrupted flows: 462611.49487848615
+2026-05-05 21:59:09,743 45404 4_rerouting_and_recovery_scenario_loop.py Calibrate capacity for non-flooded links...
+2026-05-05 21:59:09,773 45404 4_rerouting_and_recovery_scenario_loop.py Updating road speed limits...
+2026-05-05 21:59:09,776 45404 4_rerouting_and_recovery_scenario_loop.py Creating igraph network...
+2026-05-05 21:59:09,835 45404 4_rerouting_and_recovery_scenario_loop.py Running flow simulation...
+2026-05-05 21:59:09,835 45404 road_revised.py The initial supply is 462611.49487848615
+2026-05-05 21:59:09,841 45404 road_revised.py The initial number of edges in the network: 2284
+2026-05-05 21:59:09,841 45404 road_revised.py The initial number of origins: 17
+2026-05-05 21:59:09,841 45404 road_revised.py The initial number of destinations: 17
+2026-05-05 21:59:09,923 45404 road_revised.py No.1 iteration starts:
+2026-05-05 21:59:09,933 45404 road_revised.py Initial isolated flows: 0.0
+Creating argument list:   0%|          | 0/17 [00:00<?, ?it/s]Creating argument list: 100%|##########| 17/17 [00:00<?, ?it/s]
+2026-05-05 21:59:10,029 45404 road_revised.py The least-cost path flow allocation time: 0.023727893829345703.
+2026-05-05 21:59:10,029 45404 road_revised.py Non_allocated_flow: 0.0
+2026-05-05 21:59:10,042 45404 road_revised.py Create temp_flow_matrix table in duckdb...
+Processing chunks::   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  5.03chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  5.01chunk/s]
+2026-05-05 21:59:10,247 45404 road_revised.py All chunks processed. Aggregating final results...
+2026-05-05 21:59:10,271 45404 road_revised.py Complete creating temp_flow_matrix table in Duckdb!
+2026-05-05 21:59:10,296 45404 road_revised.py Updating edge speeds: 
+2026-05-05 21:59:10,310 45404 road_revised.py The total remain flow (after adjustment) is: 36319.24437377938.
+2026-05-05 21:59:10,361 45404 road_revised.py #road_links: 2284, #valid_links: 2284
+2026-05-05 21:59:10,378 45404 road_revised.py The remaining number of edges in the network: 1702
+2026-05-05 21:59:10,431 45404 road_revised.py No.2 iteration starts:
+2026-05-05 21:59:10,444 45404 road_revised.py Initial isolated flows: 0.0
+Creating argument list:   0%|          | 0/17 [00:00<?, ?it/s]Creating argument list: 100%|##########| 17/17 [00:00<00:00, 16433.09it/s]
+2026-05-05 21:59:10,543 45404 road_revised.py The least-cost path flow allocation time: 0.03217339515686035.
+2026-05-05 21:59:10,545 45404 road_revised.py Non_allocated_flow: 16670.05536428603
+2026-05-05 21:59:10,551 45404 road_revised.py Create temp_flow_matrix table in duckdb...
+Processing chunks::   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  8.40chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  8.40chunk/s]
+2026-05-05 21:59:10,677 45404 road_revised.py All chunks processed. Aggregating final results...
+2026-05-05 21:59:10,711 45404 road_revised.py Complete creating temp_flow_matrix table in Duckdb!
+2026-05-05 21:59:10,728 45404 road_revised.py Updating edge speeds: 
+2026-05-05 21:59:10,746 45404 road_revised.py The total remain flow (after adjustment) is: 35195.56667493147.
+2026-05-05 21:59:10,803 45404 road_revised.py #road_links: 2284, #valid_links: 1702
+2026-05-05 21:59:10,818 45404 road_revised.py The remaining number of edges in the network: 1702
+2026-05-05 21:59:10,874 45404 road_revised.py No.3 iteration starts:
+2026-05-05 21:59:10,882 45404 road_revised.py Initial isolated flows: 0.0
+Creating argument list:   0%|          | 0/17 [00:00<?, ?it/s]Creating argument list: 100%|##########| 17/17 [00:00<00:00, 16452.05it/s]
+2026-05-05 21:59:10,993 45404 road_revised.py The least-cost path flow allocation time: 0.038805484771728516.
+2026-05-05 21:59:10,994 45404 road_revised.py Non_allocated_flow: 16670.05536428603
+2026-05-05 21:59:10,999 45404 road_revised.py Create temp_flow_matrix table in duckdb...
+Processing chunks::   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  7.27chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  7.27chunk/s]
+2026-05-05 21:59:11,146 45404 road_revised.py All chunks processed. Aggregating final results...
+2026-05-05 21:59:11,163 45404 road_revised.py Complete creating temp_flow_matrix table in Duckdb!
+2026-05-05 21:59:11,184 45404 road_revised.py Updating edge speeds: 
+2026-05-05 21:59:11,201 45404 road_revised.py The total remain flow (after adjustment) is: 29641.194534950137.
+2026-05-05 21:59:11,256 45404 road_revised.py #road_links: 2284, #valid_links: 1702
+2026-05-05 21:59:11,271 45404 road_revised.py The remaining number of edges in the network: 1693
+2026-05-05 21:59:11,323 45404 road_revised.py No.4 iteration starts:
+2026-05-05 21:59:11,336 45404 road_revised.py Initial isolated flows: 0.0
+Creating argument list:   0%|          | 0/17 [00:00<?, ?it/s]Creating argument list: 100%|##########| 17/17 [00:00<?, ?it/s]
+2026-05-05 21:59:11,430 45404 road_revised.py The least-cost path flow allocation time: 0.03118133544921875.
+2026-05-05 21:59:11,431 45404 road_revised.py Non_allocated_flow: 17874.320800560712
+2026-05-05 21:59:11,435 45404 road_revised.py Create temp_flow_matrix table in duckdb...
+Processing chunks::   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  7.63chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  7.63chunk/s]
+2026-05-05 21:59:11,576 45404 road_revised.py All chunks processed. Aggregating final results...
+2026-05-05 21:59:11,597 45404 road_revised.py Complete creating temp_flow_matrix table in Duckdb!
+2026-05-05 21:59:11,619 45404 road_revised.py Updating edge speeds: 
+2026-05-05 21:59:11,632 45404 road_revised.py The total remain flow (after adjustment) is: 28988.501608440132.
+2026-05-05 21:59:11,678 45404 road_revised.py #road_links: 2284, #valid_links: 1693
+2026-05-05 21:59:11,702 45404 road_revised.py The remaining number of edges in the network: 1683
+2026-05-05 21:59:11,750 45404 road_revised.py No.5 iteration starts:
+2026-05-05 21:59:11,762 45404 road_revised.py Initial isolated flows: 0.0
+Creating argument list:   0%|          | 0/17 [00:00<?, ?it/s]Creating argument list: 100%|##########| 17/17 [00:00<00:00, 15719.39it/s]
+2026-05-05 21:59:11,858 45404 road_revised.py The least-cost path flow allocation time: 0.03038763999938965.
+2026-05-05 21:59:11,859 45404 road_revised.py Non_allocated_flow: 19199.40962548478
+2026-05-05 21:59:11,866 45404 road_revised.py Create temp_flow_matrix table in duckdb...
+Processing chunks::   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  8.07chunk/s]Processing chunks:: 100%|##########| 1/1 [00:00<00:00,  8.00chunk/s]
+2026-05-05 21:59:11,999 45404 road_revised.py All chunks processed. Aggregating final results...
+2026-05-05 21:59:12,016 45404 road_revised.py Complete creating temp_flow_matrix table in Duckdb!
+2026-05-05 21:59:12,030 45404 road_revised.py Updating edge speeds: 
+2026-05-05 21:59:12,053 45404 road_revised.py The total remain flow (after adjustment) is: 28757.08072577105.
+2026-05-05 21:59:12,104 45404 road_revised.py Stop: Maximum iterations reached (5) with 28757.08072577105 extra isolated flows. 
+2026-05-05 21:59:12,104 45404 road_revised.py Stop: Maximum iterations reached (5)!
+2026-05-05 21:59:12,160 45404 road_revised.py The flow simulation is completed!
+2026-05-05 21:59:12,160 45404 road_revised.py total travel cost is ($): 10198992.353400998
+2026-05-05 21:59:12,160 45404 road_revised.py total time-equiv cost is ($): 6739341.570277949
+2026-05-05 21:59:12,160 45404 road_revised.py total operating cost is ($): 3459650.7831230485
+2026-05-05 21:59:12,160 45404 road_revised.py total toll cost is ($): 0.0
+2026-05-05 21:59:12,160 45404 4_rerouting_and_recovery_scenario_loop.py The original travel costs for disrupted od: $ million 10.146408882965373
+2026-05-05 21:59:12,160 45404 4_rerouting_and_recovery_scenario_loop.py The total travel costs after disruption: $ million 10.198992353400998
+2026-05-05 21:59:12,160 45404 4_rerouting_and_recovery_scenario_loop.py The rerouting cost for scenario 1: $ million 0.05258347043562401
+2026-05-05 21:59:12,160 45404 4_rerouting_and_recovery_scenario_loop.py Saving results to disk...
+2026-05-05 21:59:12,302 45404 4_rerouting_and_recovery_scenario_loop.py Rerouting Analysis on Scenario-1 of recovery...
+2026-05-05 21:59:12,302 45404 4_rerouting_and_recovery_scenario_loop.py Updating edge capacities on D-7 of recovery...
+2026-05-05 21:59:12,498 45404 4_rerouting_and_recovery_scenario_loop.py Extracting disrupted OD pairs...
+2026-05-05 21:59:12,499 45404 4_rerouting_and_recovery_scenario_loop.py disrupted_od size: 328
+2026-05-05 21:59:12,499 45404 4_rerouting_and_recovery_scenario_loop.py chunk_size: 328
+Processing chunks:   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks: 100%|##########| 1/1 [00:00<00:00, 14.24chunk/s]
+2026-05-05 21:59:12,597 45404 4_rerouting_and_recovery_scenario_loop.py Aggregating final results...
+2026-05-05 21:59:12,613 45404 4_rerouting_and_recovery_scenario_loop.py Completing chunk process...
+2026-05-05 21:59:12,621 45404 4_rerouting_and_recovery_scenario_loop.py The total disrupted flows: 0.0
+2026-05-05 21:59:12,623 45404 4_rerouting_and_recovery_scenario_loop.py Calibrate capacity for non-flooded links...
+2026-05-05 21:59:12,627 45404 4_rerouting_and_recovery_scenario_loop.py Updating road speed limits...
+2026-05-05 21:59:12,646 45404 4_rerouting_and_recovery_scenario_loop.py Creating igraph network...
+2026-05-05 21:59:12,745 45404 4_rerouting_and_recovery_scenario_loop.py Running flow simulation...
+2026-05-05 21:59:12,748 45404 road_revised.py The initial supply is 0.0
+2026-05-05 21:59:12,751 45404 road_revised.py The initial number of edges in the network: 4541
+2026-05-05 21:59:12,752 45404 road_revised.py The initial number of origins: 0
+2026-05-05 21:59:12,752 45404 road_revised.py The initial number of destinations: 0
+2026-05-05 21:59:12,848 45404 road_revised.py The flow simulation is completed!
+2026-05-05 21:59:12,848 45404 road_revised.py total travel cost is ($): 0
+2026-05-05 21:59:12,848 45404 road_revised.py total time-equiv cost is ($): 0
+2026-05-05 21:59:12,848 45404 road_revised.py total operating cost is ($): 0
+2026-05-05 21:59:12,848 45404 road_revised.py total toll cost is ($): 0
+2026-05-05 21:59:12,849 45404 4_rerouting_and_recovery_scenario_loop.py The original travel costs for disrupted od: $ million 0.0
+2026-05-05 21:59:12,849 45404 4_rerouting_and_recovery_scenario_loop.py The total travel costs after disruption: $ million 0.0
+2026-05-05 21:59:12,849 45404 4_rerouting_and_recovery_scenario_loop.py The rerouting cost for scenario 1: $ million 0.0
+2026-05-05 21:59:12,849 45404 4_rerouting_and_recovery_scenario_loop.py Saving results to disk...
+2026-05-05 21:59:12,978 45404 4_rerouting_and_recovery_scenario_loop.py Rerouting Analysis on Scenario-1 of recovery...
+2026-05-05 21:59:12,978 45404 4_rerouting_and_recovery_scenario_loop.py Updating edge capacities on D-14 of recovery...
+2026-05-05 21:59:13,206 45404 4_rerouting_and_recovery_scenario_loop.py Extracting disrupted OD pairs...
+2026-05-05 21:59:13,206 45404 4_rerouting_and_recovery_scenario_loop.py disrupted_od size: 328
+2026-05-05 21:59:13,207 45404 4_rerouting_and_recovery_scenario_loop.py chunk_size: 328
+Processing chunks:   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks: 100%|##########| 1/1 [00:00<00:00, 13.46chunk/s]
+2026-05-05 21:59:13,305 45404 4_rerouting_and_recovery_scenario_loop.py Aggregating final results...
+2026-05-05 21:59:13,319 45404 4_rerouting_and_recovery_scenario_loop.py Completing chunk process...
+2026-05-05 21:59:13,328 45404 4_rerouting_and_recovery_scenario_loop.py The total disrupted flows: 0.0
+2026-05-05 21:59:13,328 45404 4_rerouting_and_recovery_scenario_loop.py Calibrate capacity for non-flooded links...
+2026-05-05 21:59:13,351 45404 4_rerouting_and_recovery_scenario_loop.py Updating road speed limits...
+2026-05-05 21:59:13,355 45404 4_rerouting_and_recovery_scenario_loop.py Creating igraph network...
+2026-05-05 21:59:13,450 45404 4_rerouting_and_recovery_scenario_loop.py Running flow simulation...
+2026-05-05 21:59:13,452 45404 road_revised.py The initial supply is 0.0
+2026-05-05 21:59:13,456 45404 road_revised.py The initial number of edges in the network: 4541
+2026-05-05 21:59:13,456 45404 road_revised.py The initial number of origins: 0
+2026-05-05 21:59:13,456 45404 road_revised.py The initial number of destinations: 0
+2026-05-05 21:59:13,554 45404 road_revised.py The flow simulation is completed!
+2026-05-05 21:59:13,555 45404 road_revised.py total travel cost is ($): 0
+2026-05-05 21:59:13,555 45404 road_revised.py total time-equiv cost is ($): 0
+2026-05-05 21:59:13,555 45404 road_revised.py total operating cost is ($): 0
+2026-05-05 21:59:13,555 45404 road_revised.py total toll cost is ($): 0
+2026-05-05 21:59:13,555 45404 4_rerouting_and_recovery_scenario_loop.py The original travel costs for disrupted od: $ million 0.0
+2026-05-05 21:59:13,555 45404 4_rerouting_and_recovery_scenario_loop.py The total travel costs after disruption: $ million 0.0
+2026-05-05 21:59:13,555 45404 4_rerouting_and_recovery_scenario_loop.py The rerouting cost for scenario 1: $ million 0.0
+2026-05-05 21:59:13,556 45404 4_rerouting_and_recovery_scenario_loop.py Saving results to disk...
+2026-05-05 21:59:13,680 45404 4_rerouting_and_recovery_scenario_loop.py Rerouting Analysis on Scenario-1 of recovery...
+2026-05-05 21:59:13,680 45404 4_rerouting_and_recovery_scenario_loop.py Updating edge capacities on D-30 of recovery...
+2026-05-05 21:59:13,895 45404 4_rerouting_and_recovery_scenario_loop.py Extracting disrupted OD pairs...
+2026-05-05 21:59:13,896 45404 4_rerouting_and_recovery_scenario_loop.py disrupted_od size: 328
+2026-05-05 21:59:13,896 45404 4_rerouting_and_recovery_scenario_loop.py chunk_size: 328
+Processing chunks:   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks: 100%|##########| 1/1 [00:00<00:00, 11.39chunk/s]
+2026-05-05 21:59:14,007 45404 4_rerouting_and_recovery_scenario_loop.py Aggregating final results...
+2026-05-05 21:59:14,023 45404 4_rerouting_and_recovery_scenario_loop.py Completing chunk process...
+2026-05-05 21:59:14,030 45404 4_rerouting_and_recovery_scenario_loop.py The total disrupted flows: 0.0
+2026-05-05 21:59:14,030 45404 4_rerouting_and_recovery_scenario_loop.py Calibrate capacity for non-flooded links...
+2026-05-05 21:59:14,052 45404 4_rerouting_and_recovery_scenario_loop.py Updating road speed limits...
+2026-05-05 21:59:14,057 45404 4_rerouting_and_recovery_scenario_loop.py Creating igraph network...
+2026-05-05 21:59:14,156 45404 4_rerouting_and_recovery_scenario_loop.py Running flow simulation...
+2026-05-05 21:59:14,158 45404 road_revised.py The initial supply is 0.0
+2026-05-05 21:59:14,162 45404 road_revised.py The initial number of edges in the network: 4541
+2026-05-05 21:59:14,162 45404 road_revised.py The initial number of origins: 0
+2026-05-05 21:59:14,162 45404 road_revised.py The initial number of destinations: 0
+2026-05-05 21:59:14,278 45404 road_revised.py The flow simulation is completed!
+2026-05-05 21:59:14,278 45404 road_revised.py total travel cost is ($): 0
+2026-05-05 21:59:14,278 45404 road_revised.py total time-equiv cost is ($): 0
+2026-05-05 21:59:14,278 45404 road_revised.py total operating cost is ($): 0
+2026-05-05 21:59:14,278 45404 road_revised.py total toll cost is ($): 0
+2026-05-05 21:59:14,278 45404 4_rerouting_and_recovery_scenario_loop.py The original travel costs for disrupted od: $ million 0.0
+2026-05-05 21:59:14,278 45404 4_rerouting_and_recovery_scenario_loop.py The total travel costs after disruption: $ million 0.0
+2026-05-05 21:59:14,278 45404 4_rerouting_and_recovery_scenario_loop.py The rerouting cost for scenario 1: $ million 0.0
+2026-05-05 21:59:14,278 45404 4_rerouting_and_recovery_scenario_loop.py Saving results to disk...
+2026-05-05 21:59:14,420 45404 4_rerouting_and_recovery_scenario_loop.py Rerouting Analysis on Scenario-1 of recovery...
+2026-05-05 21:59:14,421 45404 4_rerouting_and_recovery_scenario_loop.py Updating edge capacities on D-60 of recovery...
+2026-05-05 21:59:14,622 45404 4_rerouting_and_recovery_scenario_loop.py Extracting disrupted OD pairs...
+2026-05-05 21:59:14,623 45404 4_rerouting_and_recovery_scenario_loop.py disrupted_od size: 328
+2026-05-05 21:59:14,623 45404 4_rerouting_and_recovery_scenario_loop.py chunk_size: 328
+Processing chunks:   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks: 100%|##########| 1/1 [00:00<00:00, 14.90chunk/s]
+2026-05-05 21:59:14,712 45404 4_rerouting_and_recovery_scenario_loop.py Aggregating final results...
+2026-05-05 21:59:14,730 45404 4_rerouting_and_recovery_scenario_loop.py Completing chunk process...
+2026-05-05 21:59:14,739 45404 4_rerouting_and_recovery_scenario_loop.py The total disrupted flows: 0.0
+2026-05-05 21:59:14,745 45404 4_rerouting_and_recovery_scenario_loop.py Calibrate capacity for non-flooded links...
+2026-05-05 21:59:14,763 45404 4_rerouting_and_recovery_scenario_loop.py Updating road speed limits...
+2026-05-05 21:59:14,768 45404 4_rerouting_and_recovery_scenario_loop.py Creating igraph network...
+2026-05-05 21:59:14,863 45404 4_rerouting_and_recovery_scenario_loop.py Running flow simulation...
+2026-05-05 21:59:14,865 45404 road_revised.py The initial supply is 0.0
+2026-05-05 21:59:14,869 45404 road_revised.py The initial number of edges in the network: 4541
+2026-05-05 21:59:14,871 45404 road_revised.py The initial number of origins: 0
+2026-05-05 21:59:14,871 45404 road_revised.py The initial number of destinations: 0
+2026-05-05 21:59:14,970 45404 road_revised.py The flow simulation is completed!
+2026-05-05 21:59:14,970 45404 road_revised.py total travel cost is ($): 0
+2026-05-05 21:59:14,970 45404 road_revised.py total time-equiv cost is ($): 0
+2026-05-05 21:59:14,971 45404 road_revised.py total operating cost is ($): 0
+2026-05-05 21:59:14,971 45404 road_revised.py total toll cost is ($): 0
+2026-05-05 21:59:14,971 45404 4_rerouting_and_recovery_scenario_loop.py The original travel costs for disrupted od: $ million 0.0
+2026-05-05 21:59:14,971 45404 4_rerouting_and_recovery_scenario_loop.py The total travel costs after disruption: $ million 0.0
+2026-05-05 21:59:14,971 45404 4_rerouting_and_recovery_scenario_loop.py The rerouting cost for scenario 1: $ million 0.0
+2026-05-05 21:59:14,971 45404 4_rerouting_and_recovery_scenario_loop.py Saving results to disk...
+2026-05-05 21:59:15,111 45404 4_rerouting_and_recovery_scenario_loop.py Rerouting Analysis on Scenario-1 of recovery...
+2026-05-05 21:59:15,111 45404 4_rerouting_and_recovery_scenario_loop.py Updating edge capacities on D-90 of recovery...
+2026-05-05 21:59:15,317 45404 4_rerouting_and_recovery_scenario_loop.py Extracting disrupted OD pairs...
+2026-05-05 21:59:15,318 45404 4_rerouting_and_recovery_scenario_loop.py disrupted_od size: 328
+2026-05-05 21:59:15,318 45404 4_rerouting_and_recovery_scenario_loop.py chunk_size: 328
+Processing chunks:   0%|          | 0/1 [00:00<?, ?chunk/s]Processing chunks: 100%|##########| 1/1 [00:00<00:00, 12.00chunk/s]
+2026-05-05 21:59:15,412 45404 4_rerouting_and_recovery_scenario_loop.py Aggregating final results...
+2026-05-05 21:59:15,424 45404 4_rerouting_and_recovery_scenario_loop.py Completing chunk process...
+2026-05-05 21:59:15,434 45404 4_rerouting_and_recovery_scenario_loop.py The total disrupted flows: 0.0
+2026-05-05 21:59:15,434 45404 4_rerouting_and_recovery_scenario_loop.py Calibrate capacity for non-flooded links...
+2026-05-05 21:59:15,453 45404 4_rerouting_and_recovery_scenario_loop.py Updating road speed limits...
+2026-05-05 21:59:15,457 45404 4_rerouting_and_recovery_scenario_loop.py Creating igraph network...
+2026-05-05 21:59:15,613 45404 4_rerouting_and_recovery_scenario_loop.py Running flow simulation...
+2026-05-05 21:59:15,616 45404 road_revised.py The initial supply is 0.0
+2026-05-05 21:59:15,627 45404 road_revised.py The initial number of edges in the network: 4541
+2026-05-05 21:59:15,629 45404 road_revised.py The initial number of origins: 0
+2026-05-05 21:59:15,629 45404 road_revised.py The initial number of destinations: 0
+2026-05-05 21:59:15,738 45404 road_revised.py The flow simulation is completed!
+2026-05-05 21:59:15,738 45404 road_revised.py total travel cost is ($): 0
+2026-05-05 21:59:15,738 45404 road_revised.py total time-equiv cost is ($): 0
+2026-05-05 21:59:15,738 45404 road_revised.py total operating cost is ($): 0
+2026-05-05 21:59:15,738 45404 road_revised.py total toll cost is ($): 0
+2026-05-05 21:59:15,738 45404 4_rerouting_and_recovery_scenario_loop.py The original travel costs for disrupted od: $ million 0.0
+2026-05-05 21:59:15,741 45404 4_rerouting_and_recovery_scenario_loop.py The total travel costs after disruption: $ million 0.0
+2026-05-05 21:59:15,741 45404 4_rerouting_and_recovery_scenario_loop.py The rerouting cost for scenario 1: $ million 0.0
+2026-05-05 21:59:15,741 45404 4_rerouting_and_recovery_scenario_loop.py Saving results to disk...
+2026-05-05 21:59:15,882 45404 4_rerouting_and_recovery_scenario_loop.py Saving overall rerouting costs to disk...

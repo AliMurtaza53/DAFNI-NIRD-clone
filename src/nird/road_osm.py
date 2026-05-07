@@ -202,7 +202,7 @@ def voc_func(speed: float) -> float:
     Returns
     -------
     float
-        The unit vehicle operating cost: £/km
+        The unit vehicle operating cost: $/km
     """
     s = speed * cons.CONV_MILE_TO_KM  # km/hour
     lpkm = 0.178 - 0.00299 * s + 0.0000205 * (s**2)  # fuel consumption (liter/km)
@@ -215,7 +215,7 @@ def cost_func(
     distance: float,
     voc: float,
     toll: float,
-) -> Tuple[float, float, float]:  # time: hour, distance: mph, voc: £/km
+) -> Tuple[float, float, float]:  # time: hour, distance: mph, voc: $/km
     """Calculate the total travel cost.
 
     Parameters
@@ -225,19 +225,19 @@ def cost_func(
     distance: float
         Travel distance: mile
     voc:
-        Vehicle operating cost: £/km
+        Vehicle operating cost: $/km
 
     Returns
     -------
     cost: float
-        The total travel costs: £
+        The total travel costs: $
     c_time: float
-        The time-equivalent costs: £
+        The time-equivalent costs: $
     c_operate: float
-        The vehicle operating costs/fuel costs: £
+        The vehicle operating costs/fuel costs: $
     """
     ave_occ = 1.06  # average car occupancy = 1.6
-    vot = 17.69  # value of time (VOT): 17.69 £/hour
+    vot = 17.69  # value of time (VOT): 17.69 $/hour
     d = distance * cons.CONV_MILE_TO_KM
     c_time = time * ave_occ * vot
     c_operate = d * voc
@@ -463,14 +463,14 @@ def create_igraph_network(
     edgeLengthList = (
         road_links.geometry.length * cons.CONV_METER_TO_MILE
     ).tolist()  # mile
-    edgeTollList = road_links.average_toll_cost.tolist()  # £
+    edgeTollList = road_links.average_toll_cost.tolist()  # $
     edgeSpeedList = road_links.initial_flow_speeds.tolist()  # mph
 
     # travel time
     timeList = np.array(edgeLengthList) / np.array(edgeSpeedList)  # hour
 
-    # total travel cost (£)
-    vocList = np.vectorize(voc_func, otypes=None)(edgeSpeedList)  # £/km
+    # total travel cost ($)
+    vocList = np.vectorize(voc_func, otypes=None)(edgeSpeedList)  # $/km
     costList, timeCostList, operateCostList = np.vectorize(cost_func, otypes=None)(
         timeList, edgeLengthList, vocList, edgeTollList
     )
@@ -483,7 +483,7 @@ def create_igraph_network(
     test_net.es["edge_name"] = edgeNameList
     test_net.es["weight"] = weightList
 
-    # Cmponent costs (£)
+    # Cmponent costs ($)
     edge_cost_dict = dict(zip(edgeNameList, weightList))
     edge_timecost_dict = dict(zip(edgeNameList, timeCostList))
     edge_operatecost_dict = dict(zip(edgeNameList, operateCostList))
@@ -648,9 +648,9 @@ def update_network_structure(
         costList, timeCostList, operateCostList = np.vectorize(cost_func, otypes=None)(
             timeList, lengthList, vocList, tollList
         )  # hour
-        weightList = costList.tolist()  # £
+        weightList = costList.tolist()  # $
         network.es["weight"] = weightList
-        # estimate edge traveling cost (£)
+        # estimate edge traveling cost ($)
         edge_cost_dict = dict(
             zip(
                 network.es["edge_name"],
@@ -1197,9 +1197,9 @@ def network_flow_model(
     road_links.acc_capacity = road_links.acc_capacity.astype(int)
 
     print("The flow simulation is completed!")
-    print(f"total travel cost is (£): {total_cost}")
-    print(f"total time-equiv cost is (£): {time_equiv_cost}")
-    print(f"total operating cost is (£): {operating_cost}")
-    print(f"total toll cost is (£): {toll_cost}")
+    print(f"total travel cost is ($): {total_cost}")
+    print(f"total time-equiv cost is ($): {time_equiv_cost}")
+    print(f"total operating cost is ($): {operating_cost}")
+    print(f"total toll cost is ($): {toll_cost}")
 
     return road_links, isolated_flow_dict, odpfc

@@ -59,16 +59,46 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
    ```
    This converts FAF5 network format to NIRD-compatible link and node tables.
 
+Note: If you already have the converted NIRD parquet files in place, you can skip `convert_faf5_to_nird.py` and begin the workflow at `scripts/1_network_flow_model_revision.py`.
+
+Profiling runner (local, optional):
+
+- Script: `tools/profile_runner.py`
+- Output: `profiles/` (contains `.prof`, `*_summary.txt`, `timings.csv`, `timings.png`)
+
+Short status of the latest profiling run:
+- A rerun completed for scripts 1–3 and produced `profiles/`; scripts 4–5 still failed on input/data issues, so their timings are blank for now.
+- Observed wall times: script 1 = 8.770s, script 2 = 5.185s, script 3 = 47.820s.
+- Script 4 failed looking for `recovery_dfesign_updated.csv`; script 5 failed with `ZeroDivisionError` in the Morris analysis path.
+- A `profiles/timings.png` bar chart is available for the completed scripts.
+- Re-run the profiler from the recommended environment if you want a fresh pass:
+
+```powershell
+micromamba activate nird
+python tools\profile_runner.py
+```
+
+The runner writes per-script cProfile files, `timings.csv`, and `timings.png` under `profiles/`.
+
 5. **Run the analysis pipeline:**
    ```bash
    python scripts/1_network_flow_model_revision.py
-   python scripts/2_intersection_analysis.py
+    # Script 2 must be run once per scenario (depth_key=30 cm shown here)
+    # event_key: 1=base, 2=low, 3=high
+    python scripts/2_intersection_analysis.py 30 1
+    python scripts/2_intersection_analysis.py 30 2
+    python scripts/2_intersection_analysis.py 30 3
    python scripts/3_damage_analysis.py
+   python scripts/3_postprocess_damage.py
    python scripts/4_rerouting_and_recovery_scenario_loop.py
-   python scripts/5_sensitivity_analysis_direct.py
-   python scripts/5_sensitivity_analysis_indirect.py
-   jupyter notebook scripts/visualize_pipeline_results.ipynb
    ```
+   The two `5_xx` sensitivity scripts are intentionally skipped for now and are not included in profiling.
+
+    For toy Fairfax inputs, Script 2 scenario keys are:
+    - `1` = base
+    - `2` = low
+    - `3` = high
+
 
 **Output**: Results and figures are saved to `results/` directory.
 
@@ -81,7 +111,7 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
    │  └─ Input: FAF5 GeoDataFrame (data/fairfax_soge_clusters_toy/inputs/networks/faf5/)
    │     Output: NIRD road links/nodes (parquet files)
    │
-2. Network Analysis (Scripts 1–5)
+2. Network Analysis (Scripts 1–4)
    ├─ 1_network_flow_model_revision.py
    │  └─ Assign baseline traffic flows to network
    │
@@ -91,12 +121,14 @@ This branch contains a **cleaned, ready-to-run demonstration** of the NIRD workf
    ├─ 3_damage_analysis.py
    │  └─ Compute damage fractions and costs per link
    │
+   ├─ 3_postprocess_damage.py
+   │  └─ Summarize per-event damage outputs
+   │
    ├─ 4_rerouting_and_recovery_scenario_loop.py
    │  └─ Simulate rerouting behavior and recovery dynamics
    │
-   ├─ 5_sensitivity_analysis_direct.py & 5_sensitivity_analysis_indirect.py
-   │  └─ Quantify model sensitivity to key parameters
-   │
+   └─ 5_xx sensitivity scripts are skipped for now and not profiled
+
 3. Visualization & Review
    └─ visualize_pipeline_results.ipynb
       └─ Generate summary figures and diagnostic plots
@@ -267,6 +299,7 @@ DAFNI-NIRD/
 │   ├── 1_network_flow_model_revision.py
 │   ├── 2_intersection_analysis.py
 │   ├── 3_damage_analysis.py
+│   ├── 3_postprocess_damage.py
 │   ├── 4_rerouting_and_recovery_scenario_loop.py
 │   ├── 5_sensitivity_analysis_direct.py
 │   ├── 5_sensitivity_analysis_indirect.py

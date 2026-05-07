@@ -13,6 +13,13 @@ import os
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(REPO_ROOT))
+
 import pandas as pd
 import numpy as np
 
@@ -102,6 +109,7 @@ def preprocess(intersections, road_links, lad_shp=None):
         "road_label",
         # "LAD21CD",
     ]
+    road_cols = [c for c in road_cols if c in joined.columns]
 
     # helper to build the surface/river DF
     def build_hazard_df(
@@ -248,6 +256,12 @@ Xs = preprocess(intersections, road_links, lad_shp)
 # temp_Xs = Xs.copy()
 # remove damage level
 temp_Xs = Xs[Xs.damage_level == "severe"].reset_index(drop=True)  #!!! update
+damage_focus = os.environ.get("NIRD_DIRECT_DAMAGE_LEVEL", "all").strip().lower()
+if damage_focus in {"no", "minor", "moderate", "extensive", "severe"}:
+    temp_Xs = Xs[Xs.damage_level.astype(str).str.lower() == damage_focus].reset_index(drop=True)
+else:
+    temp_Xs = Xs.copy().reset_index(drop=True)
+
 if temp_Xs.empty:
     temp_Xs = Xs.copy().reset_index(drop=True)
 # convert string objects to numeric values for sensitivity analysis
@@ -285,57 +299,50 @@ road_label_mapping = {
 flood_type_mapping = {"surface": 0, "river": 1}
 damage_level_mapping = {"no": 0, "minor": 1, "moderate": 2, "extensive": 3, "severe": 4}
 
-temp_Xs["road_classification"] = temp_Xs["road_classification"].map(
-    road_classification_mapping
-)
-temp_Xs["form_of_way"] = temp_Xs["form_of_way"].map(form_of_way_mapping)
-temp_Xs["trunk_road"] = temp_Xs["trunk_road"].map(trunk_road_mapping)
-temp_Xs["road_label"] = temp_Xs["road_label"].map(road_label_mapping)
-temp_Xs["flood_type"] = temp_Xs["flood_type"].map(flood_type_mapping)
-temp_Xs["damage_level"] = temp_Xs["damage_level"].map(damage_level_mapping)
+if "road_classification" in temp_Xs.columns:
+    temp_Xs["road_classification"] = temp_Xs["road_classification"].map(road_classification_mapping)
+if "form_of_way" in temp_Xs.columns:
+    temp_Xs["form_of_way"] = temp_Xs["form_of_way"].map(form_of_way_mapping)
+if "trunk_road" in temp_Xs.columns:
+    temp_Xs["trunk_road"] = temp_Xs["trunk_road"].map(trunk_road_mapping)
+if "road_label" in temp_Xs.columns:
+    temp_Xs["road_label"] = temp_Xs["road_label"].map(road_label_mapping)
+if "flood_type" in temp_Xs.columns:
+    temp_Xs["flood_type"] = temp_Xs["flood_type"].map(flood_type_mapping)
+if "damage_level" in temp_Xs.columns:
+    temp_Xs["damage_level"] = temp_Xs["damage_level"].map(damage_level_mapping)
 temp_Xs = normalised(temp_Xs)  # nomralize all input features between 0 and 1
+temp_Xs = temp_Xs.fillna(0)
 
-# Morris
-# Define the problem for Morris Sensitivity Analysis
-D = 11  # Number of input variables
+# Morris (dynamic: only keep features supported by current data schema)
+feature_name_map = {
+    "length": "Road Length",
+    "road_classification": "Road Classification",
+    "form_of_way": "Carriageway Type",
+    "urban": "Location",
+    "lanes": "Lanes",
+    "averageWidth": "Road Width",
+    "road_label": "Structure",
+    "flood_type": "Flood Type",
+    "flood_depth": "Flood Depth",
+    "damage_ratio": "Damage Ratio",
+    "damage_value": "Unit Asset Value",
+}
+
+feature_cols = [c for c in feature_name_map.keys() if c in temp_Xs.columns]
+D = len(feature_cols)
+if D == 0:
+    print("No supported direct-sensitivity features available after preprocessing. Skipping.")
+    sys.exit(0)
+
 problem = {
     "num_vars": D,
-    "names": [
-        "Road Length",  # Length of the road link
-        "Road Classification",  # e.g., A Road, B Road, Motorway
-        "Carriageway Type",  #  e.g., Single Carriageway, Dual Carriageway
-        "Location",  # Urban or rural classification (binary: 0 or 1)
-        "Lanes",  # Number of lanes on the road
-        "Road Width",  # Average width of the road link
-        "Structure",  # Label indicating road structure (e.g., road, bridge, tunnel)
-        "Flood Type",  # Type of flood (e.g., surface, river)
-        "Flood Depth",  # Depth of flooding at the road link
-        # "damage_level",  # Level of damage (e.g., no, minor, moderate, extensive, severe)
-        "Damage Ratio",  # Damage ratio (min, max)
-        "Unit Asset Value",  # Unit repairing/maintenance cost (min, max)"
-    ],
-    "bounds": [
-        [0, 1],
-        [0, 1],
-        [0, 1],
-        [0, 1],
-        [0, 1],
-        [0, 1],
-        [0, 1],
-        [0, 1],
-        [0, 1],
-        # [0, 1],
-        [0, 1],
-        [0, 1],
-    ],
+    "names": [feature_name_map[c] for c in feature_cols],
+    "bounds": [[0, 1] for _ in range(D)],
 }
 
 # Convert input and output data to NumPy arrays
-inputs = (
-    temp_Xs.drop(columns=["trunk_road", "damage_cost", "damage_level"])
-    .to_numpy()
-    .astype(np.float64)
-)  # Input variables
+inputs = temp_Xs[feature_cols].to_numpy().astype(np.float64)  # Input variables
 outputs = (
     temp_Xs["damage_cost"].to_numpy().astype(np.float64)
 )  # Target variable (damage costs)
@@ -399,20 +406,26 @@ def create_gradient(values, cmap_name="Blues"):
     return [cmap(norm(v)) for v in values]
 
 
-mean_colors = create_gradient(df["mean"].values, cmap_name="Blues")
-var_colors = create_gradient(df["variance"].values, cmap_name="Reds")
+# Filter out factors with near-zero sensitivity to declutter plot
+threshold_mu = df["mean"].max() * 0.05 if df["mean"].max() > 0 else 0.01
+df_filtered = df[(df["mean"] >= threshold_mu) | (df["variance"] >= threshold_mu)].copy()
+if df_filtered.empty:
+    df_filtered = df.copy()  # fallback: keep all if filtering removes everything
+
+mean_colors = create_gradient(df_filtered["mean"].values, cmap_name="Blues")
+var_colors = create_gradient(df_filtered["variance"].values, cmap_name="Reds")
 sns.set(style="whitegrid")
 fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
 # ----- Mean Plot -----
-axes[0].barh(df["factor"], df["mean"], color=mean_colors)
+axes[0].barh(df_filtered["factor"], df_filtered["mean"], color=mean_colors)
 axes[0].invert_yaxis()  # highest at top
 axes[0].set_title("Morris Sensitivity: Mean (First-Order Effect)", fontsize=14)
 axes[0].set_xlabel("Normalised Morris Mean")
 axes[0].set_ylabel("Factors")
 
 # ----- Variance Plot -----
-axes[1].barh(df["factor"], df["variance"], color=var_colors)
+axes[1].barh(df_filtered["factor"], df_filtered["variance"], color=var_colors)
 axes[1].invert_yaxis()
 axes[1].set_title(
     "Morris Sensitivity: Variance (Interaction / Nonlinearity)", fontsize=14
@@ -505,13 +518,19 @@ S1_abs = res_df["S1_abs"].to_numpy(dtype=float)
 S1_abs = S1_abs / S1_abs.sum() if S1_abs.sum() else S1_abs
 ST = res_df["ST"].to_numpy(dtype=float)
 
+# Filter to meaningful factors: top N by combined importance (S1_abs + ST)
+combined_importance = S1_abs + ST
+top_n = min(8, len(parameters))  # show top 8 factors maximum
+top_indices = np.argsort(combined_importance)[-top_n:][::-1]
+
 plt.figure(figsize=(6.5, 6))
 handles = []
 
-for i, param in enumerate(parameters):
+for idx in top_indices:
+    param = parameters[idx]
     h = plt.scatter(
-        S1_abs[i],
-        ST[i],
+        S1_abs[idx],
+        ST[idx],
         marker=marker_map[param],
         color=color_map[param],  # ← unified color mapping
         alpha=0.9,
@@ -521,6 +540,15 @@ for i, param in enumerate(parameters):
         label=param,
     )
     handles.append(h)
+    # Only annotate top 5 factors to reduce clutter
+    if len(handles) <= 5:
+        plt.annotate(
+            param,
+            (S1_abs[idx], ST[idx]),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=10,
+        )
 
 plt.xlabel(r"$\mu^*$")
 plt.ylabel(r"$\sigma$")

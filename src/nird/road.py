@@ -487,7 +487,7 @@ def create_igraph_network(
     test_net.es["edge_name"] = edgeNameList
     test_net.es["weight"] = weightList
 
-    # Cmponent costs (£)
+    # Cmponent costs ($)
     edge_cost_dict = dict(zip(edgeNameList, weightList))
     edge_timecost_dict = dict(zip(edgeNameList, timeCostList))
     edge_operatecost_dict = dict(zip(edgeNameList, operateCostList))
@@ -653,9 +653,9 @@ def update_network_structure(
         costList, timeCostList, operateCostList = np.vectorize(cost_func, otypes=None)(
             timeList, lengthList, vocList, tollList
         )  # hour
-        weightList = costList.tolist()  # £
+        weightList = costList.tolist()  # $
         network.es["weight"] = weightList
-        # estimate edge traveling cost (£)
+        # estimate edge traveling cost ($)
         edge_cost_dict = dict(
             zip(
                 network.es["edge_name"],
@@ -1221,9 +1221,9 @@ def network_flow_model(
     )
 
     print("The flow simulation is completed!")
-    print(f"total travel cost is (£): {total_cost}")
-    print(f"total time-equiv cost is (£): {time_equiv_cost}")
-    print(f"total operating cost is (£): {operating_cost}")
-    print(f"total toll cost is (£): {toll_cost}")
+    print(f"total travel cost is ($): {total_cost}")
+    print(f"total time-equiv cost is ($): {time_equiv_cost}")
+    print(f"total operating cost is ($): {operating_cost}")
+    print(f"total toll cost is ($): {toll_cost}")
 
     return road_links, od_node_2021, isolated_flow_dict

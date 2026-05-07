@@ -178,14 +178,14 @@ def voc_func(
     Returns
     -------
     float
-        The unit vehicle operating cost: £/km
+        The unit vehicle operating cost: $/km
     """
     s = speed * cons.CONV_MILE_TO_KM  # km/hour
     lpkm = 0.178 - 0.00299 * s + 0.0000205 * (s**2)  # fuel consumption (liter/km)
     voc_per_km = (
         140 * lpkm * cons.PENCE_TO_POUND
     )  # average petrol cost: 140 pence/liter
-    return voc_per_km  # £/km
+    return voc_per_km  # $/km
 
 
 def cost_func(
@@ -193,7 +193,7 @@ def cost_func(
     distance: float,
     voc_per_km: float,
     toll: float,
-) -> Tuple[float, float, float]:  # time: hour, distance: mph, voc: £/km
+) -> Tuple[float, float, float]:  # time: hour, distance: mph, voc: $/km
     """Calculate the total travel cost.
 
     Parameters
@@ -203,19 +203,19 @@ def cost_func(
     distance: float
         Travel distance: mile
     voc:
-        Vehicle operating cost: £/km
+        Vehicle operating cost: $/km
 
     Returns
     -------
     cost: float
-        The total travel costs: £
+        The total travel costs: $
     c_time: float
-        The time-equivalent costs: £
+        The time-equivalent costs: $
     c_operate: float
-        The vehicle operating costs/fuel costs: £
+        The vehicle operating costs/fuel costs: $
     """
     ave_occ = 1.06  # average car occupancy = 1.6
-    vot = 17.69  # value of time (VOT): 17.69 £/hour
+    vot = 17.69  # value of time (VOT): 17.69 $/hour
     d = distance * cons.CONV_MILE_TO_KM
     c_time = time * ave_occ * vot
     c_operate = d * voc_per_km
@@ -1081,9 +1081,9 @@ def network_flow_model(
     road_links = road_links[road_links_columns]
 
     logging.info("The flow simulation is completed!")
-    logging.info(f"total travel cost is (£): {total_cost}")
-    logging.info(f"total time-equiv cost is (£): {cost_time}")
-    logging.info(f"total operating cost is (£): {cost_fuel}")
-    logging.info(f"total toll cost is (£): {cost_toll}")
+    logging.info(f"total travel cost is ($): {total_cost}")
+    logging.info(f"total time-equiv cost is ($): {cost_time}")
+    logging.info(f"total operating cost is ($): {cost_fuel}")
+    logging.info(f"total toll cost is ($): {cost_toll}")
 
     return road_links, isolation, odpfc, cList
