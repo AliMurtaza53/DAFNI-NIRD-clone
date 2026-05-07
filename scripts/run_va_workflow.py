@@ -105,75 +105,97 @@ def save_gdf(gdf: gpd.GeoDataFrame, path: Path, layer: str):
 
 def build_inverse_distance_od(
     centroid_nodes: gpd.GeoDataFrame,
-    zone_to_node: dict[int, int],
+    road_nodes: gpd.GeoDataFrame,
     total_trips: int,
     decay_power: float = 1.0,
     min_distance_m: float = 1.0,
 ) -> pd.DataFrame:
-    centroid_nodes = centroid_nodes.copy()
-    centroid_nodes = centroid_nodes[centroid_nodes["FAFID"].notna()].copy()
-    centroid_nodes["FAFID"] = centroid_nodes["FAFID"].astype(int)
-    centroid_nodes = centroid_nodes.drop_duplicates(subset=["FAFID"]).copy()
-
-    centroid_nodes = centroid_nodes.to_crs(DEFAULT_TARGET_CRS)
-
+    """Build synthetic OD matrix using all centroid nodes (not just FAF aggregates).
+    
+    Traffic assignment happens at the centroid level, so we generate a full
+    195 × 195 matrix (or similar) with inverse-distance decay.
+    
+    Args:
+        centroid_nodes: GeoDataFrame with all Virginia centroid nodes
+        road_nodes: GeoDataFrame with all road network nodes (to find nearest matches)
+        total_trips: Total trips to distribute (e.g., 25,000,000)
+        decay_power: Power for inverse-distance decay (1.0 = 1/d)
+        min_distance_m: Minimum distance to avoid division by zero
+        
+    Returns:
+        DataFrame with origin_node, destination_node, Car21 (trips) columns
+    """
+    centroid_nodes = centroid_nodes.copy().to_crs(DEFAULT_TARGET_CRS)
+    
     if centroid_nodes.empty:
-        raise ValueError("No Virginia centroid nodes found after filtering")
-
-    centroid_nodes = centroid_nodes.sort_values("FAFID").reset_index(drop=True)
-    coordinates = np.column_stack((centroid_nodes.geometry.x.to_numpy(), centroid_nodes.geometry.y.to_numpy()))
+        raise ValueError("No Virginia centroid nodes provided")
+    
+    print(f"\nBuilding synthetic 25M-trip OD matrix for {len(centroid_nodes):,} centroids...")
+    
+    # Map each centroid to its nearest network node
+    print("  Mapping centroids to network nodes...")
+    centroid_to_network_node = {}
+    for idx, cent_row in centroid_nodes.iterrows():
+        cent_geom = cent_row.geometry
+        distances = road_nodes.geometry.distance(cent_geom)
+        nearest_idx = distances.idxmin()
+        nearest_node_id = road_nodes.loc[nearest_idx, 'node_id']
+        centroid_to_network_node[idx] = nearest_node_id
+    
+    # Extract coordinates for distance calculation (keep original index for mapping)
+    coordinates = np.column_stack((
+        centroid_nodes.geometry.x.to_numpy(),
+        centroid_nodes.geometry.y.to_numpy()
+    ))
+    
+    # Calculate pairwise distances
     delta = coordinates[:, None, :] - coordinates[None, :, :]
     distance_matrix = np.sqrt((delta**2).sum(axis=2))
-    np.fill_diagonal(distance_matrix, np.inf)
-
+    np.fill_diagonal(distance_matrix, np.inf)  # Exclude self-pairs
+    
+    # Build inverse-distance weights
     weights = 1.0 / np.power(np.maximum(distance_matrix, min_distance_m), decay_power)
     weights[np.isinf(weights)] = 0.0
     weights[np.isnan(weights)] = 0.0
-
+    
     total_weight = weights.sum()
     if total_weight <= 0:
-        raise ValueError("Inverse-distance weights sum to zero; cannot build OD matrix")
-
+        raise ValueError("Inverse-distance weights sum to zero")
+    
+    # Normalize to total trips
     flows = weights * (float(total_trips) / total_weight)
-
+    
+    # Build OD rows
     rows = []
-    zone_ids = centroid_nodes["FAFID"].tolist()
-    for origin_idx, origin_zone in enumerate(zone_ids):
-        origin_node = zone_to_node.get(int(origin_zone))
-        if origin_node is None:
-            continue
-        for destination_idx, destination_zone in enumerate(zone_ids):
-            if origin_idx == destination_idx:
-                continue
-            destination_node = zone_to_node.get(int(destination_zone))
-            if destination_node is None:
-                continue
-            trip_flow = flows[origin_idx, destination_idx]
+    centroid_indices = list(centroid_to_network_node.keys())
+    
+    for origin_idx_pos, origin_idx in enumerate(centroid_indices):
+        origin_node = centroid_to_network_node[origin_idx]
+        
+        for dest_idx_pos, dest_idx in enumerate(centroid_indices):
+            if origin_idx_pos == dest_idx_pos:
+                continue  # Skip self-pairs
+            
+            destination_node = centroid_to_network_node[dest_idx]
+            trip_flow = flows[origin_idx_pos, dest_idx_pos]
+            
             if trip_flow <= 0:
                 continue
-            rows.append(
-                {
-                    "origin_node": origin_node,
-                    "destination_node": destination_node,
-                    "Car21": float(trip_flow),
-                    "origin_fafid": int(origin_zone),
-                    "destination_fafid": int(destination_zone),
-                    "distance_m": float(distance_matrix[origin_idx, destination_idx]),
-                }
-            )
-
+            
+            rows.append({
+                "origin_node": origin_node,
+                "destination_node": destination_node,
+                "Car21": float(trip_flow),
+                "distance_m": float(distance_matrix[origin_idx_pos, dest_idx_pos]),
+            })
+    
     od_df = pd.DataFrame(rows)
     if od_df.empty:
-        raise ValueError("Synthetic OD generation produced no rows")
-
-    od_df = od_df.groupby(["origin_node", "destination_node"], as_index=False).agg(
-        {
-            "Car21": "sum",
-            "origin_fafid": "first",
-            "destination_fafid": "first",
-            "distance_m": "first",
-        }
-    )
+        raise ValueError("OD generation produced no rows")
+    
+    print(f"  Generated {len(od_df):,} OD pairs")
+    print(f"  Total trips: {od_df['Car21'].sum():,.0f}")
+    
     return od_df
 
 
@@ -241,16 +263,11 @@ def main() -> int:
     save_gdf(road_nodes, road_nodes_path, layer="nodes")
     save_gdf(va_centroids, centroid_path, layer="centroids")
 
-    # Map Virginia centroid zones to the clipped road network's node IDs.
-    zone_to_node = od_conv.map_faf_zones_to_network_nodes(
-        network_nodes=road_nodes,
-        centroid_nodes_path=centroid_path,
-    )
-
     # Build a 25M-trip synthetic OD matrix with inverse-distance decay.
+    # Use ALL 195 centroid nodes for assignment, not just FAF aggregates.
     od_df = build_inverse_distance_od(
         centroid_nodes=va_centroids,
-        zone_to_node=zone_to_node,
+        road_nodes=road_nodes,
         total_trips=args.total_trips,
         decay_power=args.decay_power,
     )
