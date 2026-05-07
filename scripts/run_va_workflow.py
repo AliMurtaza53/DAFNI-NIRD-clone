@@ -63,29 +63,29 @@ def normalize_state_filter(state_value: str | list[str] | None):
     return [value.strip().upper() for value in state_value if value and value.strip()]
 
 
-def filter_va_centroids(nodes: gpd.GeoDataFrame, state_name: str = "Virginia") -> gpd.GeoDataFrame:
-    """Extract all centroid nodes for a given state.
+def filter_va_centroids(nodes: gpd.GeoDataFrame, state_id: int = 51) -> gpd.GeoDataFrame:
+    """Extract all centroid nodes for Virginia (StateID==51).
     
-    FAF5 centroid nodes are marked with Centroid==1. For Virginia, we use
-    StateName to filter (not State abbreviation, as StateName has more matches).
+    FAF5 centroid nodes are marked with Centroid==1. Virginia is StateID==51.
+    Uses StateID instead of StateName to avoid catching West Virginia.
     
     Args:
         nodes: FAF5_Nodes GeoDataFrame
-        state_name: Full state name (e.g., 'Virginia')
+        state_id: Virginia's StateID (51)
         
     Returns:
-        GeoDataFrame with all centroid nodes for the state
+        GeoDataFrame with all VA centroid nodes
     """
     if "Centroid" not in nodes.columns:
         raise ValueError("FAF5_Nodes layer does not have a 'Centroid' column")
 
     centroids = nodes[nodes["Centroid"] == 1].copy()
     
-    # Filter by StateName (preferred over State abbreviation as it has more matches)
-    if "StateName" in centroids.columns:
-        centroids = centroids[centroids["StateName"].astype(str).str.contains(state_name, case=False, na=False)]
+    # Filter by StateID (51 = Virginia, avoids West Virginia)
+    if "StateID" in centroids.columns:
+        centroids = centroids[centroids["StateID"] == state_id]
     
-    print(f"{state_name} centroids: {len(centroids):,} (Centroid==1 with matching StateName)")
+    print(f"Virginia centroids: {len(centroids):,} (Centroid==1 with StateID=={state_id})")
     return centroids
 
 
@@ -241,7 +241,7 @@ def main() -> int:
     road_nodes = build_nodes_from_link_connectivity(nird_links, DEFAULT_TARGET_CRS)
 
     # Extract Virginia centroids from the FAF5 node layer.
-    va_centroids = filter_va_centroids(nodes, state_name="Virginia")
+    va_centroids = filter_va_centroids(nodes, state_id=51)
     va_centroids = va_centroids.to_crs(DEFAULT_TARGET_CRS)
 
     centroid_path = va_root / f"faf5_centroid_nodes_{args.state.upper()}.gpq"
