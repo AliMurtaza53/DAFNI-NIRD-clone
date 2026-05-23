@@ -1,3 +1,20 @@
+"""Script 2: intersection analysis for road links and flood rasters.
+
+`depth_key` controls how flood depth is translated into disruption:
+
+- depths below `depth_key` keep a positive speed, reduced by a quadratic penalty
+- depths at or above `depth_key` reduce speed to zero
+
+Example:
+        - `depth_key=15` means a 10 cm flood still leaves some speed, but a 20 cm
+            flood closes the link entirely.
+
+`event_key` selects the hazard scenario variant (1=base, 2=low, 3=high).
+Use `all` or a comma-separated list such as `2,3` to process multiple toy
+events in one process. That allows the in-memory split cache to be reused when
+the rasters share the same grid.
+"""
+
 import sys
 import os
 import time
@@ -306,7 +323,7 @@ def intersect_features_with_raster(
 
 def clip_features(
     features: gpd.GeoDataFrame,
-    clip_path: str,
+    clip_path: Optional[str],
     raster_key: str,
     boundary_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> gpd.GeoDataFrame:
@@ -325,14 +342,21 @@ def clip_features(
     """
 
     logging.info(f"Clipping features based on {raster_key}...")
-    clips = gpd.read_file(clip_path, engine="pyogrio")  # grid's extent (vector)
-    clips = clips.reset_index(drop=True)  # Ensure no 'index_right' column conflicts
     skip_vector_clip = False
+    clips = None
+    if clip_path is None:
+        skip_vector_clip = True
+        logging.warning(
+            "No clip vector provided; proceeding with boundary-only clipping."
+        )
+    else:
+        clips = gpd.read_file(clip_path, engine="pyogrio")  # grid's extent (vector)
+        clips = clips.reset_index(drop=True)  # Ensure no 'index_right' column conflicts
 
     # Temporary QA guard: some Aqueduct vector masks are global extent polygons
     # ([-180, -90, 180, 90] in EPSG:4326). Reprojecting this footprint to EPSG:2163
     # can collapse around the antimeridian and unintentionally clip out most links.
-    if clips.crs is not None and str(clips.crs).upper().endswith("4326"):
+    if clips is not None and clips.crs is not None and str(clips.crs).upper().endswith("4326"):
         minx, miny, maxx, maxy = clips.total_bounds
         if (
             abs(minx + 180) < 1e-6
@@ -349,7 +373,7 @@ def clip_features(
     original_columns = features.columns.tolist()
     
     # Reproject the clip shapefile only when it will be used for spatial clipping
-    if (not skip_vector_clip) and clips.crs != features.crs:
+    if (not skip_vector_clip) and clips is not None and clips.crs != features.crs:
         logging.info("Projecting Shapefile CRS to match Feature CRS...")
         clips = clips.to_crs(features.crs)
 
@@ -420,6 +444,8 @@ def compute_damage_level_on_flooded_roads(
             or "severe"
     """
 
+    if fldType == "flood":
+        fldType = "river"
     depth = fldDepth * 100  # convert from m to cm
     rc = ("" if road_classification is None else str(road_classification)).strip()
     rc_lower = rc.lower()
@@ -583,6 +609,8 @@ def compute_damage_levels_on_flooded_roads_vectorized(
 ) -> pd.Series:
     """Vectorized equivalent of compute_damage_level_on_flooded_roads()."""
 
+    if fldType == "flood":
+        fldType = "river"
     depth_cm = pd.to_numeric(fldDepth, errors="coerce") * 100.0
     rc_raw = road_classification.fillna("").astype(str).str.strip()
     rc_lower = rc_raw.str.lower()
@@ -695,7 +723,7 @@ def intersections_with_damage(
     flood_key: str,
     flood_type: str,
     flood_path: str,
-    clip_path: str,
+    clip_path: Optional[str],
     boundary_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> gpd.GeoDataFrame:
     """
@@ -741,8 +769,9 @@ def intersections_with_damage(
             intersections.loc[is_major_road, "flood_depth_surface"] - 100
         ).clip(lower=0)
     else:
-        intersections.loc[is_major_road, "flood_depth_river"] = (
-            intersections.loc[is_major_road, "flood_depth_river"] - 200
+        flood_depth_col = f"flood_depth_{flood_type}"
+        intersections.loc[is_major_road, flood_depth_col] = (
+            intersections.loc[is_major_road, flood_depth_col] - 200
         ).clip(lower=0)
 
     # Compute damage levels for flooded road segments
@@ -753,6 +782,11 @@ def intersections_with_damage(
         intersections["road_label"] if "road_label" in intersections.columns else pd.Series("", index=intersections.index),
         intersections[f"flood_depth_{flood_type}"],
     )
+    if flood_type == "flood":
+        # Keep a clear generic flood label in Script 2 outputs while mirroring to
+        # river_* for Script 3/4, which still consume the historical schema.
+        intersections["flood_depth_river"] = intersections["flood_depth_flood"]
+        intersections["damage_level_river"] = intersections["damage_level_flood"]
 
     return intersections
 
@@ -788,6 +822,8 @@ def features_with_damage(
         ].max(axis=1)
     elif "flood_depth_surface" in intersections.columns:
         intersections["flood_depth_max"] = intersections.flood_depth_surface
+    elif "flood_depth_flood" in intersections.columns:
+        intersections["flood_depth_max"] = intersections.flood_depth_flood
     elif "flood_depth_river" in intersections.columns:
         intersections["flood_depth_max"] = intersections.flood_depth_river
     else:
@@ -813,6 +849,11 @@ def features_with_damage(
             "damage_level_surface"
         ].map(damage_level_dict)
         intersections["damage_level_max"] = intersections.damage_level_surface
+    elif "damage_level_flood" in intersections.columns:
+        intersections["damage_level_flood"] = intersections[
+            "damage_level_flood"
+        ].map(damage_level_dict)
+        intersections["damage_level_max"] = intersections.damage_level_flood
     elif "damage_level_river" in intersections.columns:
         intersections["damage_level_river"] = intersections["damage_level_river"].map(
             damage_level_dict
@@ -946,7 +987,19 @@ def main(depth_key, event_key):
         )
 
     toy_hazard_dir = base_path / "inputs" / "test_17node"
+    toy_hazard_50m_dir = base_path / "inputs" / "test_141node_50m"
     toy_hazard_candidates = [
+        # Prefer higher-resolution 50 m VA rasters if available
+        toy_hazard_50m_dir / "va_hazard_class50_141node_base.tif",
+        toy_hazard_50m_dir / "va_hazard_class50_141node_low.tif",
+        toy_hazard_50m_dir / "va_hazard_class50_141node_high.tif",
+        toy_hazard_50m_dir / "va_hazard_class50_141node.tif",
+        # Fall back to 1 km VA rasters
+        base_path / "inputs" / "test_141node" / "va_hazard_class50_141node_base.tif",
+        base_path / "inputs" / "test_141node" / "va_hazard_class50_141node_low.tif",
+        base_path / "inputs" / "test_141node" / "va_hazard_class50_141node_high.tif",
+        base_path / "inputs" / "test_141node" / "va_hazard_class50_141node.tif",
+        # Fall back to Fairfax test rasters
         toy_hazard_dir / "fairfax_hazard_class50_17node_base.tif",
         toy_hazard_dir / "fairfax_hazard_class50_17node_low.tif",
         toy_hazard_dir / "fairfax_hazard_class50_17node_high.tif",
@@ -959,40 +1012,77 @@ def main(depth_key, event_key):
             [
                 base_path / "study_area" / "fairfax_study_area.gpkg",
                 base_path / "study_area" / "fairfax_study_area.geojson",
+                base_path / "study_area" / "va_study_area.gpkg",
+                base_path / "study_area" / "va_study_area.geojson",
             ]
         )
         if toy_clip_path is None:
-            raise FileNotFoundError(
-                "Could not find the Fairfax study-area boundary for toy raster clipping"
-            )
-
-        try:
-            event_key_num = int(event_key)
-        except (TypeError, ValueError):
-            raise ValueError(
-                "In toy mode, event_key must be one of: 1 (base), 2 (low), 3 (high)"
+            logging.warning(
+                "No toy study-area clip file found; falling back to analysis boundary clipping only."
             )
 
         toy_variant_map = {1: "base", 2: "low", 3: "high"}
-        if event_key_num not in toy_variant_map:
+        if event_key.lower() == "all":
+            toy_event_keys = sorted(toy_variant_map)
+        else:
+            try:
+                toy_event_keys = [int(part.strip()) for part in event_key.split(",") if part.strip()]
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "In toy mode, event_key must be one of: 1, 2, 3, all, or a comma-separated list like 2,3"
+                )
+        invalid_event_keys = [key for key in toy_event_keys if key not in toy_variant_map]
+        if invalid_event_keys:
             raise ValueError(
-                f"Invalid toy-mode event_key={event_key_num}. Use 1=base, 2=low, 3=high."
+                f"Invalid toy-mode event_key(s)={invalid_event_keys}. Use 1=base, 2=low, 3=high, all, or e.g. 2,3."
             )
 
-        toy_variant = toy_variant_map[event_key_num]
-        selected_tif = first_existing(
-            [toy_hazard_dir / f"fairfax_hazard_class50_17node_{toy_variant}.tif", toy_hazard_path]
-        )
-        logging.info(
-            f"Toy hazard raster mode enabled: event_key={event_key_num} ({toy_variant}) -> {selected_tif}"
-        )
-
-        # In toy mode, use the same raster for both surface and river so the downstream
-        # damage analysis still sees both expected depth columns.
-        event_files = {
-            "surface": [str(selected_tif)],
-            "river": [str(selected_tif)],
-        }
+        # In toy mode these scenario rasters represent the available flood hazard,
+        # not a separate surface/river pair. Use the generic "flood" label for
+        # clarity; intersections_with_damage mirrors flood_* to river_* for
+        # Script 3/4 compatibility. Set NIRD_TOY_FLOOD_TYPES=surface,river only
+        # for legacy comparison runs.
+        toy_flood_types_raw = os.environ.get("NIRD_TOY_FLOOD_TYPES", "flood")
+        toy_flood_types = [
+            flood_type.strip().lower()
+            for flood_type in toy_flood_types_raw.split(",")
+            if flood_type.strip()
+        ]
+        valid_toy_flood_types = {"surface", "river", "flood"}
+        invalid_toy_flood_types = [
+            flood_type
+            for flood_type in toy_flood_types
+            if flood_type not in valid_toy_flood_types
+        ]
+        if invalid_toy_flood_types:
+            raise ValueError(
+                "NIRD_TOY_FLOOD_TYPES may only contain 'surface', 'river', and/or 'flood'. "
+                f"Got: {invalid_toy_flood_types}"
+            )
+        if not toy_flood_types:
+            raise ValueError("NIRD_TOY_FLOOD_TYPES resolved to no flood types.")
+        event_files_by_key = {}
+        for event_key_num in toy_event_keys:
+            toy_variant = toy_variant_map[event_key_num]
+            selected_tif = first_existing(
+                [
+                    # Prefer 50 m rasters
+                    toy_hazard_50m_dir / f"va_hazard_class50_141node_{toy_variant}.tif",
+                    # Fall back to 1 km VA rasters
+                    base_path / "inputs" / "test_141node" / f"va_hazard_class50_141node_{toy_variant}.tif",
+                    # Fall back to Fairfax 17-node rasters
+                    toy_hazard_dir / f"fairfax_hazard_class50_17node_{toy_variant}.tif",
+                    toy_hazard_path,
+                ]
+            )
+            logging.info(
+                f"Toy hazard raster mode enabled: event_key={event_key_num} ({toy_variant}) -> {selected_tif}"
+            )
+            event_files_by_key[str(event_key_num)] = {
+                flood_type: [str(selected_tif)]
+                for flood_type in toy_flood_types
+            }
+        logging.info(f"Toy flood types enabled: {toy_flood_types}")
     else:
         event_files = {flood_type: [] for flood_type in ["surface", "river"]}
 
@@ -1027,7 +1117,8 @@ def main(depth_key, event_key):
 
     event_dict = defaultdict(lambda: defaultdict(list))
     if toy_hazard_path is not None:
-        event_dict[event_key] = defaultdict(list, event_files)
+        for toy_key, toy_event_files in event_files_by_key.items():
+            event_dict[toy_key] = defaultdict(list, toy_event_files)
     else:
         for flood_type, list_of_events in event_files.items():
             for event_path in list_of_events:
@@ -1071,7 +1162,7 @@ def main(depth_key, event_key):
     
     processed_event = False
     for flood_key, v in event_dict.items():
-        if flood_key != event_key:
+        if toy_hazard_path is None and flood_key != event_key:
             logging.info(f"[SKIP] Skipping flood_key={flood_key} (not matching event_key={event_key})")
             continue
         processed_event = True
@@ -1143,17 +1234,19 @@ def main(depth_key, event_key):
                 logging.info(
                     f"[INTERSECT_OK] Got {len(temp_file)} intersection results in {raster_elapsed:.2f}s"
                 )
+                merge_columns = [
+                    "e_id",
+                    "length",
+                    "index_i",
+                    "index_j",
+                    f"flood_depth_{flood_type}",
+                    f"damage_level_{flood_type}",
+                ]
+                if flood_type == "flood":
+                    # Preserve compatibility mirror columns for Script 3/4.
+                    merge_columns.extend(["flood_depth_river", "damage_level_river"])
                 intersections = intersections.merge(
-                    temp_file[
-                        [
-                            "e_id",
-                            "length",
-                            "index_i",
-                            "index_j",
-                            f"flood_depth_{flood_type}",
-                            f"damage_level_{flood_type}",
-                        ]
-                    ],
+                    temp_file[merge_columns],
                     on=["e_id", "length", "index_i", "index_j"],
                     how="outer",
                 )
@@ -1221,7 +1314,9 @@ def main(depth_key, event_key):
         road_links["flood_depth_max"] = road_links["flood_depth_max"].fillna(0.0)
         road_links["free_flow_speeds"] = road_links["free_flow_speeds"].fillna(50.0)
 
-        # compute maximum speed restriction on individual road links
+        # `depth_key` is the closure threshold in centimeters.
+        # Example: with `depth_key=15`, a 10 cm flood still allows reduced speed,
+        # while a 20 cm flood sets `max_speed` to 0 for that link.
         flood_depth_cm = pd.to_numeric(road_links["flood_depth_max"], errors="coerce") * 100.0
         free_flow_speed = pd.to_numeric(road_links["free_flow_speeds"], errors="coerce")
         road_links["max_speed"] = np.where(

@@ -120,8 +120,41 @@ def main(
         logging.info(f"For testing, sampling every {sample_stride} flows")
         od_node_2021 = od_node_2021.iloc[::sample_stride]
 
+    od_flow_col = "Car21" if "Car21" in od_node_2021.columns else (
+        "flow" if "flow" in od_node_2021.columns else None
+    )
+    if od_flow_col is None:
+        raise ValueError("OD matrix must contain either 'Car21' or 'flow' column")
+
+    od_node_2021[od_flow_col] = pd.to_numeric(
+        od_node_2021[od_flow_col], errors="coerce"
+    ).fillna(0.0)
+    node_dtype = road_link_file["from_id"].dtype
+    if pd.api.types.is_integer_dtype(node_dtype):
+        od_node_2021["origin_node"] = pd.to_numeric(
+            od_node_2021["origin_node"], errors="raise"
+        ).astype(node_dtype)
+        od_node_2021["destination_node"] = pd.to_numeric(
+            od_node_2021["destination_node"], errors="raise"
+        ).astype(node_dtype)
+    else:
+        od_node_2021["origin_node"] = od_node_2021["origin_node"].astype(node_dtype)
+        od_node_2021["destination_node"] = od_node_2021["destination_node"].astype(node_dtype)
+    total_flow = od_node_2021[od_flow_col].sum()
+    self_pair_flow = od_node_2021.loc[
+        od_node_2021["origin_node"] == od_node_2021["destination_node"],
+        od_flow_col,
+    ].sum()
+    duplicate_pair_count = int(
+        od_node_2021.groupby(["origin_node", "destination_node"]).size().gt(1).sum()
+    )
+
     logging.info(f"\n{od_node_2021}")
-    logging.info(f"Total flows: {od_node_2021.Car21.sum()}")
+    logging.info(
+        f"OD totals ({od_flow_col}): rows={len(od_node_2021):,}, "
+        f"total={total_flow:,.3f}, self_pair_flow={self_pair_flow:,.3f}, "
+        f"duplicate_pairs={duplicate_pair_count:,}"
+    )
 
     # initialise road links
     logging.info("Generate road links")

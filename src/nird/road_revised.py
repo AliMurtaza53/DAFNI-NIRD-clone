@@ -3,6 +3,7 @@
 # Standard library
 import os
 import logging
+import math
 import pickle
 import sys
 import time
@@ -825,11 +826,16 @@ def itter_path(
         return
 
     max_chunk_size = 100_000
-    if max_chunk_size > total_rows:
+    if num_of_chunk is not None and num_of_chunk > 1:
+        chunk_size = max(1, math.ceil(total_rows / num_of_chunk))
+    elif max_chunk_size > total_rows:
         chunk_size = total_rows
     else:
         num_of_chunk = min(num_of_chunk, max(1, total_rows // max_chunk_size))
         chunk_size = max(1, total_rows // max(1, num_of_chunk))
+    logging.info(
+        f"Processing {total_rows} OD path rows in chunks of {chunk_size} rows."
+    )
 
     edges = network.es
     edges_df = pd.DataFrame(
@@ -846,6 +852,114 @@ def itter_path(
     )  # network attributes
     conn.execute("DROP TABLE IF EXISTS od_results_iter")  # reset table
     conn.execute("DROP TABLE IF EXISTS edge_flows")  # reset table
+
+    if temp_flow_table is not None:
+        edges_sql = edges_df.reset_index()
+        road_caps_sql = road_links[["e_id", "acc_capacity"]].copy()
+        conn.register("edges_sql", edges_sql)
+        conn.register("road_caps_sql", road_caps_sql)
+        conn.execute("CREATE OR REPLACE TEMP TABLE edge_attrs AS SELECT * FROM edges_sql")
+        conn.execute("CREATE OR REPLACE TEMP TABLE road_caps AS SELECT * FROM road_caps_sql")
+        conn.unregister("edges_sql")
+        conn.unregister("road_caps_sql")
+
+        conn.execute("DROP TABLE IF EXISTS exploded_paths")
+        conn.execute(
+            f"""
+            CREATE TABLE exploded_paths AS
+            SELECT
+                t.origin,
+                t.destination,
+                t.flow,
+                u.ord,
+                e.e_id,
+                e.time,
+                e.fuel,
+                e.toll,
+                e.length_mile,
+                r.acc_capacity
+            FROM {temp_flow_table} t
+            CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+            JOIN edge_attrs e
+              ON e.path = u.path_idx
+            LEFT JOIN road_caps r
+              ON r.e_id = e.e_id;
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE od_results_iter AS
+            SELECT
+                origin,
+                destination,
+                LIST(e_id ORDER BY ord) AS e_id,
+                FIRST(flow) AS flow,
+                SUM(fuel) AS fuel,
+                SUM(time) AS time,
+                SUM(toll) AS toll,
+                SUM(length_mile) AS length_mile
+            FROM exploded_paths
+            GROUP BY origin, destination;
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE edge_flows AS
+            SELECT
+                e_id,
+                origin,
+                destination,
+                MAX(acc_capacity) AS acc_capacity,
+                SUM(flow) AS flow
+            FROM exploded_paths
+            GROUP BY e_id, origin, destination;
+            """
+        )
+
+        conn.execute("DROP TABLE IF EXISTS exploded_paths")
+        logging.info("All paths expanded in DuckDB. Aggregating final results...")
+
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE total AS
+            SELECT e_id, SUM(flow) AS total_flow
+            FROM edge_flows
+            GROUP BY e_id;
+            """
+        )
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE od_adjustment AS
+            SELECT
+                e.origin,
+                e.destination,
+                MIN(LEAST(e.acc_capacity / NULLIF(t.total_flow, 0), 1.0)) AS adjust_r
+            FROM edge_flows e
+            JOIN total t USING (e_id)
+            GROUP BY e.origin, e.destination;
+            """
+        )
+        conn.execute(
+            """
+            CREATE OR REPLACE TEMP TABLE temp_flow_matrix AS
+            SELECT
+                o.origin,
+                o.destination,
+                o.e_id,
+                o.flow * COALESCE(a.adjust_r, 1.0) AS flow,
+                o.fuel,
+                o.time,
+                o.toll,
+                o.length_mile
+            FROM od_results_iter o
+            LEFT JOIN od_adjustment a USING (origin, destination);
+            """
+        )
+        logging.info("Complete creating temp_flow_matrix table in Duckdb!")
+        conn.execute(f"DROP TABLE IF EXISTS {temp_flow_table}")
+        return
 
     first = True
     for start in tqdm(
@@ -1037,6 +1151,16 @@ def network_flow_model(
     initial_sumod = remain_od["Car21"].sum()
     assigned_sumod = 0
     iter_flag = 1
+    max_iterations = int(os.environ.get("NIRD_MAX_FLOW_ITERATIONS", "0"))
+    min_progress_rel = float(os.environ.get("NIRD_MIN_FLOW_PROGRESS_REL", "1e-6"))
+    stagnant_limit = int(os.environ.get("NIRD_STAGNANT_ITERATIONS", "3"))
+    stagnant_iterations = 0
+    logging.info(
+        "Iteration controls: "
+        f"max_iterations={'unbounded' if max_iterations <= 0 else max_iterations}, "
+        f"min_progress_rel={min_progress_rel}, "
+        f"stagnant_limit={stagnant_limit}"
+    )
 
     # create db (remove the pre-exist one)
     if os.path.exists(db_path):
@@ -1092,6 +1216,7 @@ def network_flow_model(
     gc.collect()
 
     while total_remain > 0:
+        previous_total_remain = total_remain
         logging.info(f"No.{iter_flag} iteration starts:")
         # remove OD pairs whose nodes are not present in the current network
         conn.register("current_valid_nodes", pd.DataFrame({"node": network.vs["name"]}))
@@ -1278,6 +1403,14 @@ def network_flow_model(
             )
             conn.execute(
                 "INSERT INTO isolated_od SELECT * FROM temp_isolated_flow_matrix_agg"
+            )
+            conn.execute(
+                """
+                DELETE FROM remain_od
+                USING temp_isolated_flow_matrix_agg i
+                WHERE CAST(remain_od.origin_node AS VARCHAR) = i.origin
+                  AND CAST(remain_od.destination_node AS VARCHAR) = i.destination;
+                """
             )
             conn.execute("DROP TABLE IF EXISTS temp_isolated_flow_matrix_agg")
         conn.execute("DROP TABLE IF EXISTS temp_isolated_flow_matrix")
@@ -1476,6 +1609,17 @@ def network_flow_model(
             or 0.0
         )
         logging.info(f"The total remain flow (after adjustment) is: {total_remain}.")
+        progress = max(previous_total_remain - total_remain, 0.0)
+        progress_rel = progress / initial_sumod if initial_sumod > 0 else 0.0
+        if progress_rel < min_progress_rel:
+            stagnant_iterations += 1
+        else:
+            stagnant_iterations = 0
+        logging.info(
+            f"Iteration progress: assigned_delta={progress}, "
+            f"progress_rel={progress_rel:.8%}, "
+            f"stagnant_iterations={stagnant_iterations}/{stagnant_limit}."
+        )
         gc.collect()
 
         # %%
@@ -1504,7 +1648,7 @@ def network_flow_model(
             )
             break
 
-        if iter_flag > 4:  # 5 iterations
+        if max_iterations > 0 and iter_flag >= max_iterations:
             temp_isolation = (
                 conn.execute(
                     "SELECT COALESCE(SUM(Car21), 0.0) FROM remain_od"
@@ -1523,10 +1667,35 @@ def network_flow_model(
                     """
                 )
             logging.info(
-                "Stop: Maximum iterations reached (5) with "
+                f"Stop: Maximum iterations reached ({max_iterations}) with "
                 f"{temp_isolation} extra isolated flows. "
             )
-            logging.info("Stop: Maximum iterations reached (5)!")
+            logging.info(f"Stop: Maximum iterations reached ({max_iterations})!")
+            break
+
+        if stagnant_limit > 0 and stagnant_iterations >= stagnant_limit:
+            temp_isolation = (
+                conn.execute(
+                    "SELECT COALESCE(SUM(Car21), 0.0) FROM remain_od"
+                ).fetchone()[0]
+                or 0.0
+            )
+            if temp_isolation > 0:
+                conn.execute(
+                    """
+                    INSERT INTO isolated_od
+                    SELECT
+                        origin_node,
+                        destination_node,
+                        Car21 AS flow
+                    FROM remain_od;
+                    """
+                )
+            logging.info(
+                "Stop: Insufficient progress for "
+                f"{stagnant_iterations} consecutive iterations with "
+                f"{temp_isolation} extra isolated flows. "
+            )
             break
 
         # %%

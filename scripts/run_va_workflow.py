@@ -3,7 +3,7 @@ Virginia FAF5-to-NIRD workflow.
 
 This script starts from the FAF5 GDB, clips the road network to Virginia,
 extracts Virginia centroid connectors, and builds a synthetic OD matrix using
-an inverse-distance model with a 25M trip benchmark.
+an inverse-distance model with a 3M trip benchmark.
 
 It reuses the existing converter helpers in `convert_faf5_to_nird.py` and
 `convert_faf5_od_to_nird.py` so the workflow stays aligned with the repo's
@@ -26,7 +26,6 @@ import fiona
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
 import convert_faf5_to_nird as links_conv  # noqa: E402
 import convert_faf5_od_to_nird as od_conv  # noqa: E402
 
@@ -35,7 +34,7 @@ DEFAULT_GDB_PATH = (
     r"C:\Users\alimu\Desktop\Github\FAF5_Model_Highway_Network\Networks\Geodatabase Format\FAF5Network.gdb"
 )
 DEFAULT_TARGET_CRS = "EPSG:2163"
-DEFAULT_TOTAL_TRIPS = 25_000_000
+DEFAULT_TOTAL_TRIPS = 3_000_000
 DEFAULT_STATE = "VA"
 
 
@@ -109,28 +108,33 @@ def build_inverse_distance_od(
     total_trips: int,
     decay_power: float = 1.0,
     min_distance_m: float = 1.0,
+    tolerance: float = 0.01,
 ) -> pd.DataFrame:
-    """Build synthetic OD matrix using all centroid nodes (not just FAF aggregates).
+    """Build synthetic routable OD matrix using inverse-distance weights.
     
-    Traffic assignment happens at the centroid level, so we generate a full
-    195 × 195 matrix (or similar) with inverse-distance decay.
+    Centroids can collapse to the same nearest network node. Those collapsed
+    self-pairs cannot be routed, so they are excluded before final scaling.
     
     Args:
         centroid_nodes: GeoDataFrame with all Virginia centroid nodes
         road_nodes: GeoDataFrame with all road network nodes (to find nearest matches)
-        total_trips: Total trips to distribute (e.g., 25,000,000)
+        total_trips: Total trips to distribute (e.g., 3,000,000)
         decay_power: Power for inverse-distance decay (1.0 = 1/d)
         min_distance_m: Minimum distance to avoid division by zero
+        tolerance: Acceptable relative difference from target total after scaling
         
     Returns:
         DataFrame with origin_node, destination_node, Car21 (trips) columns
     """
     centroid_nodes = centroid_nodes.copy().to_crs(DEFAULT_TARGET_CRS)
+    road_nodes = road_nodes.copy().to_crs(DEFAULT_TARGET_CRS)
     
     if centroid_nodes.empty:
         raise ValueError("No Virginia centroid nodes provided")
+    if road_nodes.empty:
+        raise ValueError("No road network nodes provided")
     
-    print(f"\nBuilding synthetic 25M-trip OD matrix for {len(centroid_nodes):,} centroids...")
+    print(f"\nBuilding synthetic {total_trips:,}-trip OD matrix for {len(centroid_nodes):,} centroids...")
     
     # Map each centroid to its nearest network node
     print("  Mapping centroids to network nodes...")
@@ -161,13 +165,13 @@ def build_inverse_distance_od(
     total_weight = weights.sum()
     if total_weight <= 0:
         raise ValueError("Inverse-distance weights sum to zero")
-    
-    # Normalize to total trips
-    flows = weights * (float(total_trips) / total_weight)
-    
-    # Build OD rows
+
+    # Build OD rows using raw weights first. Exclude pairs whose centroids map
+    # to the same network node, because igraph returns an empty path for them.
     rows = []
     centroid_indices = list(centroid_to_network_node.keys())
+    collapsed_self_pair_count = 0
+    collapsed_self_pair_weight = 0.0
     
     for origin_idx_pos, origin_idx in enumerate(centroid_indices):
         origin_node = centroid_to_network_node[origin_idx]
@@ -177,24 +181,61 @@ def build_inverse_distance_od(
                 continue  # Skip self-pairs
             
             destination_node = centroid_to_network_node[dest_idx]
-            trip_flow = flows[origin_idx_pos, dest_idx_pos]
+            trip_weight = float(weights[origin_idx_pos, dest_idx_pos])
             
-            if trip_flow <= 0:
+            if trip_weight <= 0:
+                continue
+            if str(origin_node) == str(destination_node):
+                collapsed_self_pair_count += 1
+                collapsed_self_pair_weight += trip_weight
                 continue
             
             rows.append({
                 "origin_node": origin_node,
                 "destination_node": destination_node,
-                "Car21": float(trip_flow),
+                "weight": trip_weight,
                 "distance_m": float(distance_matrix[origin_idx_pos, dest_idx_pos]),
             })
     
-    od_df = pd.DataFrame(rows)
-    if od_df.empty:
-        raise ValueError("OD generation produced no rows")
+    raw_routable_od = pd.DataFrame(rows)
+    if raw_routable_od.empty:
+        raise ValueError("OD generation produced no routable rows")
+
+    raw_routable_weight = float(raw_routable_od["weight"].sum())
+    if raw_routable_weight <= 0:
+        raise ValueError("Routable inverse-distance weights sum to zero")
+
+    raw_routable_od["distance_weight"] = (
+        raw_routable_od["distance_m"] * raw_routable_od["weight"]
+    )
+    od_df = raw_routable_od.groupby(
+        ["origin_node", "destination_node"], as_index=False
+    ).agg(
+        weight=("weight", "sum"),
+        distance_weight=("distance_weight", "sum"),
+    )
+    od_df["distance_m"] = od_df["distance_weight"] / od_df["weight"]
+    od_df["Car21"] = od_df["weight"] * (float(total_trips) / raw_routable_weight)
+    od_df = od_df[["origin_node", "destination_node", "Car21", "distance_m"]]
+
+    final_total = float(od_df["Car21"].sum())
+    relative_error = abs(final_total - float(total_trips)) / float(total_trips)
+    if relative_error > tolerance:
+        raise ValueError(
+            f"Final OD total {final_total:,.3f} differs from target "
+            f"{total_trips:,.3f} by {relative_error:.2%}, above {tolerance:.2%}"
+        )
     
-    print(f"  Generated {len(od_df):,} OD pairs")
-    print(f"  Total trips: {od_df['Car21'].sum():,.0f}")
+    print(f"  Raw centroid pair weight: {total_weight:,.6f}")
+    print(
+        "  Removed collapsed self-pairs after node mapping: "
+        f"{collapsed_self_pair_count:,} pairs, weight={collapsed_self_pair_weight:,.6f}"
+    )
+    print(f"  Routable centroid-pair rows before aggregation: {len(raw_routable_od):,}")
+    print(f"  Routable OD pairs after aggregation: {len(od_df):,}")
+    print(f"  Scale target: {total_trips:,.0f}")
+    print(f"  Final OD total: {final_total:,.3f}")
+    print(f"  Final OD target error: {relative_error:.4%}")
     
     return od_df
 
@@ -210,6 +251,8 @@ def main() -> int:
     args = parser.parse_args()
 
     config = load_config()
+    input_root_value = config.get("paths", {}).get("soge_clusters")
+    input_root = Path(input_root_value) if input_root_value else None
     output_root = Path(config.get("paths", {}).get("output_path", "results"))
     if output_root.exists() and output_root.is_dir():
         va_root = output_root / "va_workflow"
@@ -248,12 +291,15 @@ def main() -> int:
     road_links_path = va_root / f"faf5_road_links_{args.state.upper()}.gpq"
     road_nodes_path = va_root / f"faf5_road_nodes_{args.state.upper()}.gpq"
     od_path = va_root / f"faf5_od_matrix_{args.state.upper()}_inverse_distance_{int(args.total_trips/1_000_000)}m.pq"
+    script1_od_path = input_root / "census_datasets" / "faf5_od_matrix.pq" if input_root is not None else None
 
     if args.dry_run:
         print(f"Dry run: would write road links to {road_links_path}")
         print(f"Dry run: would write road nodes to {road_nodes_path}")
         print(f"Dry run: would write centroid nodes to {centroid_path}")
         print(f"Dry run: would write synthetic OD to {od_path}")
+        if script1_od_path is not None:
+            print(f"Dry run: would also write Script 1 OD to {script1_od_path}")
         print(f"Road links after clipping: {len(nird_links):,}")
         print(f"Road nodes after clipping: {len(road_nodes):,}")
         print(f"Virginia centroids: {len(va_centroids):,}")
@@ -263,7 +309,7 @@ def main() -> int:
     save_gdf(road_nodes, road_nodes_path, layer="nodes")
     save_gdf(va_centroids, centroid_path, layer="centroids")
 
-    # Build a 25M-trip synthetic OD matrix with inverse-distance decay.
+    # Build a synthetic OD matrix with inverse-distance decay.
     # Use ALL 195 centroid nodes for assignment, not just FAF aggregates.
     od_df = build_inverse_distance_od(
         centroid_nodes=va_centroids,
@@ -273,6 +319,10 @@ def main() -> int:
     )
     od_df.to_parquet(od_path, index=False)
     print(f"Wrote synthetic OD matrix to {od_path}")
+    if script1_od_path is not None:
+        script1_od_path.parent.mkdir(parents=True, exist_ok=True)
+        od_df.to_parquet(script1_od_path, index=False)
+        print(f"Wrote Script 1 OD matrix to {script1_od_path}")
     print(f"OD rows: {len(od_df):,}")
     print(f"Total trips: {od_df['Car21'].sum():,.2f}")
 

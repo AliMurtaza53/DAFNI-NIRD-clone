@@ -541,7 +541,7 @@ def main():
         - damage_ratio_road_flood.xlsx:
             Excel file containing damage curves for various road classifications and
                 flow conditions.
-        - damage_cost_road_flood_uk.xlsx:
+        - damage_cost_road_flood.xlsx:
             Excel file containing asset damage values for roads, tunnels, and bridges.
         - GB_road_links_with_bridges.gpq:
             GeoDataFrame of road network links with attributes.
@@ -563,11 +563,8 @@ def main():
     damage_ratio_path = first_existing(
         [
             base_path / "damage_curves" / "damage_ratio_road_flood.xlsx",
-            base_path / "damage_curves" / "damage_ratio_road_flood_uk.xlsx",
             base_path / "inputs" / "lookup" / "damage_ratio_road_flood.xlsx",
-            base_path / "inputs" / "lookup" / "damage_ratio_road_flood_uk.xlsx",
             base_path / "tables" / "damage_ratio_road_flood.xlsx",
-            base_path / "tables" / "damage_ratio_road_flood_uk.xlsx",
         ]
     )
     if damage_ratio_path is None:
@@ -575,14 +572,13 @@ def main():
 
     damage_cost_path = first_existing(
         [
-            base_path / "asset_costs" / "damage_cost_road_flood_uk.xlsx",
-            base_path / "inputs" / "lookup" / "damage_cost_road_flood_uk.xlsx",
-            base_path / "tables" / "damage_cost_road_flood_uk.xlsx",
+            base_path / "asset_costs" / "damage_cost_road_flood.xlsx",
+            base_path / "inputs" / "lookup" / "damage_cost_road_flood.xlsx",
+            base_path / "tables" / "damage_cost_road_flood.xlsx",
         ]
     )
     if damage_cost_path is None:
-        raise FileNotFoundError("Could not find damage_cost_road_flood_uk.xlsx in standard or toy lookup paths")
-
+        raise FileNotFoundError("Could not find damage_cost_road_flood.xlsx in standard or toy lookup paths")
     # damage curves
     damages_ratio_df = pd.read_excel(damage_ratio_path)
     damage_curves = create_damage_curves(damages_ratio_df)

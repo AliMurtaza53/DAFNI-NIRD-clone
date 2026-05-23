@@ -1,7 +1,7 @@
 {
   "paths": {
-    "soge_clusters": "C:\\Users\\alimu\\NIRD_Data\\fairfax_soge_clusters_toy",
-    "base_path": "C:\\Users\\alimu\\NIRD_Data\\fairfax_soge_clusters_toy",
+    "soge_clusters": "C:\\Users\\alimu\\NIRD_Data\\va_soge_clusters_toy",
+    "base_path": "C:\\Users\\alimu\\NIRD_Data\\va_soge_clusters_toy",
     "output_path": "results"
   }
 }
