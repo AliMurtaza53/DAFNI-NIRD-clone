@@ -26,8 +26,12 @@ import fiona
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 import convert_faf5_to_nird as links_conv  # noqa: E402
 import convert_faf5_od_to_nird as od_conv  # noqa: E402
+from nird import freight_od_disaggregation as freight_od  # noqa: E402
 
 
 DEFAULT_GDB_PATH = (
@@ -100,6 +104,43 @@ def save_gdf(gdf: gpd.GeoDataFrame, path: Path, layer: str):
     else:
         gdf.to_file(path, driver="GPKG", layer=layer)
     print(f"Wrote {len(gdf):,} rows to {path}")
+
+
+def subarea_node_map_from_centroids(
+    centroids: pd.DataFrame,
+    road_nodes: gpd.GeoDataFrame,
+    crs: str,
+) -> pd.DataFrame:
+    """Build the subarea-to-network-node map needed by Script 1 OD export."""
+
+    if "node_id" in centroids.columns:
+        return freight_od.coerce_subarea_node_map_from_centroids(centroids)
+    if "subarea_id" not in centroids.columns:
+        raise ValueError("Freight centroid table must include subarea_id")
+
+    if "geometry" in centroids.columns:
+        if not isinstance(centroids, gpd.GeoDataFrame):
+            centroid_gdf = gpd.GeoDataFrame(centroids, geometry="geometry")
+        else:
+            centroid_gdf = centroids.copy()
+        if centroid_gdf.crs is None:
+            centroid_gdf = centroid_gdf.set_crs(crs)
+        centroid_gdf = centroid_gdf.to_crs(road_nodes.crs)
+    elif {"x", "y"}.issubset(centroids.columns):
+        centroid_gdf = gpd.GeoDataFrame(
+            centroids.copy(),
+            geometry=gpd.points_from_xy(centroids["x"], centroids["y"]),
+            crs=crs,
+        ).to_crs(road_nodes.crs)
+    else:
+        raise ValueError("Freight centroid table must include node_id, geometry, or x/y columns")
+
+    nearest = gpd.sjoin_nearest(
+        centroid_gdf[["subarea_id", "geometry"]],
+        road_nodes[["node_id", "geometry"]],
+        how="left",
+    )
+    return nearest[["subarea_id", "node_id"]].dropna().drop_duplicates("subarea_id")
 
 
 def build_inverse_distance_od(
@@ -248,6 +289,20 @@ def main() -> int:
     parser.add_argument("--total-trips", type=int, default=DEFAULT_TOTAL_TRIPS, help="Benchmark trips for synthetic OD")
     parser.add_argument("--decay-power", type=float, default=1.0, help="Inverse-distance decay power")
     parser.add_argument("--dry-run", action="store_true", help="Only report actions; do not write files")
+    parser.add_argument("--freight-flow-table", default=None, help="Optional FAF5 commodity flow table for freight OD disaggregation")
+    parser.add_argument("--freight-crosswalk", default=None, help="Optional FAF zone-to-subarea crosswalk")
+    parser.add_argument("--freight-weights", default=None, help="Optional subarea production/attraction weight table")
+    parser.add_argument("--freight-centroids", default=None, help="Optional subarea centroid or node-map table")
+    parser.add_argument("--freight-payloads", default=None, help="Optional commodity/truck payload factor table")
+    parser.add_argument("--freight-distance-matrix", default=None, help="Optional subarea-to-subarea skim table")
+    parser.add_argument("--freight-year", default="2021", help="FAF flow year for freight OD disaggregation")
+    parser.add_argument(
+        "--freight-tons-unit",
+        default="thousand_tons",
+        choices=["tons", "thousand_tons"],
+        help="Unit of the FAF tons column",
+    )
+    parser.add_argument("--freight-mode-filter", default="1", help="Mode to keep for freight preprocessing; use 'all' to disable")
     args = parser.parse_args()
 
     config = load_config()
@@ -291,13 +346,39 @@ def main() -> int:
     road_links_path = va_root / f"faf5_road_links_{args.state.upper()}.gpq"
     road_nodes_path = va_root / f"faf5_road_nodes_{args.state.upper()}.gpq"
     od_path = va_root / f"faf5_od_matrix_{args.state.upper()}_inverse_distance_{int(args.total_trips/1_000_000)}m.pq"
+    freight_od_path = va_root / f"faf5_freight_od_matrix_{args.state.upper()}_{args.freight_year}.pq"
     script1_od_path = input_root / "census_datasets" / "faf5_od_matrix.pq" if input_root is not None else None
+    freight_paths = [
+        args.freight_flow_table,
+        args.freight_crosswalk,
+        args.freight_weights,
+        args.freight_centroids,
+        args.freight_payloads,
+    ]
+    use_freight_od = any(freight_paths)
+    if use_freight_od and not all(freight_paths):
+        missing = [
+            name
+            for name, value in [
+                ("--freight-flow-table", args.freight_flow_table),
+                ("--freight-crosswalk", args.freight_crosswalk),
+                ("--freight-weights", args.freight_weights),
+                ("--freight-centroids", args.freight_centroids),
+                ("--freight-payloads", args.freight_payloads),
+            ]
+            if not value
+        ]
+        raise ValueError(f"Freight OD preprocessing requires all core freight inputs. Missing: {missing}")
 
     if args.dry_run:
         print(f"Dry run: would write road links to {road_links_path}")
         print(f"Dry run: would write road nodes to {road_nodes_path}")
         print(f"Dry run: would write centroid nodes to {centroid_path}")
-        print(f"Dry run: would write synthetic OD to {od_path}")
+        if use_freight_od:
+            print("Dry run: would build freight OD via nird.freight_od_disaggregation")
+            print(f"Dry run: would write freight assignment OD to {freight_od_path}")
+        else:
+            print(f"Dry run: would write synthetic OD to {od_path}")
         if script1_od_path is not None:
             print(f"Dry run: would also write Script 1 OD to {script1_od_path}")
         print(f"Road links after clipping: {len(nird_links):,}")
@@ -309,16 +390,49 @@ def main() -> int:
     save_gdf(road_nodes, road_nodes_path, layer="nodes")
     save_gdf(va_centroids, centroid_path, layer="centroids")
 
-    # Build a synthetic OD matrix with inverse-distance decay.
-    # Use ALL 195 centroid nodes for assignment, not just FAF aggregates.
-    od_df = build_inverse_distance_od(
-        centroid_nodes=va_centroids,
-        road_nodes=road_nodes,
-        total_trips=args.total_trips,
-        decay_power=args.decay_power,
-    )
-    od_df.to_parquet(od_path, index=False)
-    print(f"Wrote synthetic OD matrix to {od_path}")
+    if use_freight_od:
+        inputs = freight_od.load_input_tables(
+            faf_flow_path=args.freight_flow_table,
+            crosswalk_path=args.freight_crosswalk,
+            weights_path=args.freight_weights,
+            centroids_path=args.freight_centroids,
+            payload_factors_path=args.freight_payloads,
+            distance_matrix_path=args.freight_distance_matrix,
+        )
+        subarea_node_map = subarea_node_map_from_centroids(
+            inputs.centroids,
+            road_nodes=road_nodes,
+            crs=DEFAULT_TARGET_CRS,
+        )
+        mode_filter = None if str(args.freight_mode_filter).lower() == "all" else args.freight_mode_filter
+        freight_result = freight_od.run_freight_disaggregation(
+            inputs,
+            year=args.freight_year,
+            output_dir=va_root,
+            subarea_node_map=subarea_node_map,
+            tons_unit=args.freight_tons_unit,
+            mode_filter=mode_filter,
+            prefix=f"faf5_freight_{args.state.upper()}_{args.freight_year}",
+        )
+        od_df = freight_result["assignment_od"]
+        if od_df is None:
+            raise RuntimeError("Freight disaggregation did not produce an assignment OD table")
+        od_df.to_parquet(freight_od_path, index=False)
+        print(f"Wrote freight assignment OD matrix to {freight_od_path}")
+        preservation = freight_result["diagnostics"]["faf_total_preservation"]
+        failed = int((~preservation["within_tolerance"]).sum())
+        print(f"Freight OD preservation checks outside tolerance: {failed:,}")
+    else:
+        # Build a synthetic OD matrix with inverse-distance decay.
+        # Use ALL 195 centroid nodes for assignment, not just FAF aggregates.
+        od_df = build_inverse_distance_od(
+            centroid_nodes=va_centroids,
+            road_nodes=road_nodes,
+            total_trips=args.total_trips,
+            decay_power=args.decay_power,
+        )
+        od_df.to_parquet(od_path, index=False)
+        print(f"Wrote synthetic OD matrix to {od_path}")
     if script1_od_path is not None:
         script1_od_path.parent.mkdir(parents=True, exist_ok=True)
         od_df.to_parquet(script1_od_path, index=False)
