@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pandas as pd
 
 from nird import freight_od_disaggregation as freight_od
@@ -63,3 +65,28 @@ def test_schema_markdown_mentions_assignment_contract():
     assert "`origin_node`" in markdown
     assert "`destination_node`" in markdown
     assert "`Car21`" in markdown
+
+
+def test_va_smoke_fixture_runs_from_disk(tmp_path):
+    fixture_dir = Path(__file__).parent / "fixtures" / "freight_od_va_smoke"
+    inputs = freight_od.load_input_tables(
+        faf_flow_path=fixture_dir / "faf5_flows.csv",
+        crosswalk_path=fixture_dir / "crosswalk.csv",
+        weights_path=fixture_dir / "weights.csv",
+        centroids_path=fixture_dir / "centroids.csv",
+        payload_factors_path=fixture_dir / "payload_factors.csv",
+    )
+    result = freight_od.run_freight_disaggregation(
+        inputs,
+        year=2021,
+        output_dir=tmp_path,
+        subarea_node_map=freight_od.coerce_subarea_node_map_from_centroids(inputs.centroids),
+        tons_unit="thousand_tons",
+        mode_filter=1,
+        prefix="va_smoke",
+    )
+
+    assert result["diagnostics"]["faf_total_preservation"]["within_tolerance"].all()
+    assert result["assignment_od"]["Car21"].sum() > 0
+    assert (tmp_path / "va_smoke_county_tonnage_od.pq").exists()
+    assert (tmp_path / "va_smoke_truck_trip_od.pq").exists()

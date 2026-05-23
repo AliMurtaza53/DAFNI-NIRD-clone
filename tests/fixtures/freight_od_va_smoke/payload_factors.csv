@@ -1,0 +1,3 @@
+commodity,truck_type,payload_tons,distance_bin
+01,combination,20.0,all
+02,single_unit,10.0,all
