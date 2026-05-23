@@ -126,3 +126,6 @@ _plottings*
 # Project-specific: Data and outputs (user-specific, should not be committed)
 data/
 results/
+logs/
+profiles/
+va_*_log.txt
