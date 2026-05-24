@@ -143,6 +143,62 @@ def subarea_node_map_from_centroids(
     return nearest[["subarea_id", "node_id"]].dropna().drop_duplicates("subarea_id")
 
 
+def assignment_od_from_county_od(
+    county_od_df: pd.DataFrame,
+    county_node_map_path: str | None = None,
+) -> pd.DataFrame:
+    """Convert a county-level freight OD table to Script 1 OD when possible."""
+
+    if {"origin_node", "destination_node", "Car21"}.issubset(county_od_df.columns):
+        od_df = county_od_df[["origin_node", "destination_node", "Car21"]].copy()
+        od_df["Car21"] = pd.to_numeric(od_df["Car21"], errors="coerce").fillna(0.0)
+        return od_df.groupby(["origin_node", "destination_node"], as_index=False)["Car21"].sum()
+
+    if county_node_map_path is None:
+        raise ValueError(
+            "County experimental OD is county-level only. Provide --county-node-map "
+            "with county_id,node_id columns, or prebuild origin_node,destination_node,Car21."
+        )
+    node_map = pd.read_csv(county_node_map_path, dtype=str)
+    node_map.columns = [str(col).strip() for col in node_map.columns]
+    if not {"county_id", "node_id"}.issubset(node_map.columns):
+        raise ValueError("--county-node-map must contain county_id,node_id columns")
+    required = {"origin_county", "destination_county"}
+    if not required.issubset(county_od_df.columns):
+        raise ValueError("County experimental OD must contain origin_county,destination_county columns")
+    flow_col = "daily_truck_trips" if "daily_truck_trips" in county_od_df.columns else (
+        "annual_truck_trips" if "annual_truck_trips" in county_od_df.columns else None
+    )
+    if flow_col is None:
+        raise ValueError("County experimental OD must contain daily_truck_trips or annual_truck_trips")
+    od = county_od_df.copy()
+    if flow_col == "annual_truck_trips":
+        od["Car21"] = pd.to_numeric(od[flow_col], errors="coerce").fillna(0.0) / 365.0
+    else:
+        od["Car21"] = pd.to_numeric(od[flow_col], errors="coerce").fillna(0.0)
+    node_map = node_map[["county_id", "node_id"]].drop_duplicates("county_id")
+    od["origin_county"] = od["origin_county"].astype(str).str.strip()
+    od["destination_county"] = od["destination_county"].astype(str).str.strip()
+    od = od.merge(
+        node_map.rename(columns={"county_id": "origin_county", "node_id": "origin_node"}),
+        on="origin_county",
+        how="inner",
+    )
+    od = od.merge(
+        node_map.rename(columns={"county_id": "destination_county", "node_id": "destination_node"}),
+        on="destination_county",
+        how="inner",
+    )
+    return od.groupby(["origin_node", "destination_node"], as_index=False)["Car21"].sum()
+
+
+def read_od_table(path: str | Path) -> pd.DataFrame:
+    od_path = Path(path)
+    if od_path.suffix.lower() in {".pq", ".parquet"}:
+        return pd.read_parquet(od_path)
+    return pd.read_csv(od_path, dtype=str)
+
+
 def build_inverse_distance_od(
     centroid_nodes: gpd.GeoDataFrame,
     road_nodes: gpd.GeoDataFrame,
@@ -289,6 +345,12 @@ def main() -> int:
     parser.add_argument("--total-trips", type=int, default=DEFAULT_TOTAL_TRIPS, help="Benchmark trips for synthetic OD")
     parser.add_argument("--decay-power", type=float, default=1.0, help="Inverse-distance decay power")
     parser.add_argument("--dry-run", action="store_true", help="Only report actions; do not write files")
+    parser.add_argument(
+        "--od-source",
+        choices=["synthetic", "freight_gravity", "faf5_county_experimental"],
+        default="synthetic",
+        help="OD source to write for Script 1. Default keeps current synthetic inverse-distance behavior.",
+    )
     parser.add_argument("--freight-flow-table", default=None, help="Optional FAF5 commodity flow table for freight OD disaggregation")
     parser.add_argument("--freight-crosswalk", default=None, help="Optional FAF zone-to-subarea crosswalk")
     parser.add_argument("--freight-weights", default=None, help="Optional subarea production/attraction weight table")
@@ -303,6 +365,8 @@ def main() -> int:
         help="Unit of the FAF tons column",
     )
     parser.add_argument("--freight-mode-filter", default="1", help="Mode to keep for freight preprocessing; use 'all' to disable")
+    parser.add_argument("--county-od-path", default=None, help="County OD output from nird.faf5_county_disaggregation")
+    parser.add_argument("--county-node-map", default=None, help="Optional county_id,node_id map for county OD assignment export")
     args = parser.parse_args()
 
     config = load_config()
@@ -355,7 +419,7 @@ def main() -> int:
         args.freight_centroids,
         args.freight_payloads,
     ]
-    use_freight_od = any(freight_paths)
+    use_freight_od = args.od_source == "freight_gravity" or any(freight_paths)
     if use_freight_od and not all(freight_paths):
         missing = [
             name
@@ -369,12 +433,17 @@ def main() -> int:
             if not value
         ]
         raise ValueError(f"Freight OD preprocessing requires all core freight inputs. Missing: {missing}")
+    if args.od_source == "faf5_county_experimental" and not args.county_od_path:
+        raise ValueError("--od-source faf5_county_experimental requires --county-od-path")
 
     if args.dry_run:
         print(f"Dry run: would write road links to {road_links_path}")
         print(f"Dry run: would write road nodes to {road_nodes_path}")
         print(f"Dry run: would write centroid nodes to {centroid_path}")
-        if use_freight_od:
+        print(f"Dry run: OD source is {args.od_source}")
+        if args.od_source == "faf5_county_experimental":
+            print(f"Dry run: would read county experimental OD from {args.county_od_path}")
+        elif use_freight_od:
             print("Dry run: would build freight OD via nird.freight_od_disaggregation")
             print(f"Dry run: would write freight assignment OD to {freight_od_path}")
         else:
@@ -390,7 +459,21 @@ def main() -> int:
     save_gdf(road_nodes, road_nodes_path, layer="nodes")
     save_gdf(va_centroids, centroid_path, layer="centroids")
 
-    if use_freight_od:
+    print(f"Using OD source: {args.od_source}")
+    if args.od_source == "faf5_county_experimental":
+        county_df = read_od_table(args.county_od_path)
+        tons_total = pd.to_numeric(county_df.get("tons", pd.Series(dtype=float)), errors="coerce").fillna(0.0).sum()
+        daily_total = pd.to_numeric(
+            county_df.get("daily_truck_trips", pd.Series(dtype=float)),
+            errors="coerce",
+        ).fillna(0.0).sum()
+        print(
+            "Loaded BTS experimental county OD: "
+            f"rows={len(county_df):,}, tons={tons_total:,.3f}, daily_truck_trips={daily_total:,.3f}"
+        )
+        od_df = assignment_od_from_county_od(county_df, county_node_map_path=args.county_node_map)
+        print(f"Converted county OD to assignment OD rows: {len(od_df):,}, Car21={od_df['Car21'].sum():,.3f}")
+    elif use_freight_od:
         inputs = freight_od.load_input_tables(
             faf_flow_path=args.freight_flow_table,
             crosswalk_path=args.freight_crosswalk,
