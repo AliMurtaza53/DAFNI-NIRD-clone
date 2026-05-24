@@ -36,9 +36,9 @@ MODE_CODES = {
 SCTG_G5_GROUPS: tuple[tuple[str, range], ...] = (
     ("sctg0109", range(1, 10)),
     ("sctg1014", range(10, 15)),
-    ("sctg1520", range(15, 21)),
-    ("sctg2130", range(21, 31)),
-    ("sctg3143", range(31, 44)),
+    ("sctg1519", range(15, 20)),
+    ("sctg2033", range(20, 34)),
+    ("sctg3499", range(34, 100)),
 )
 
 COUNTY_OD_COLUMNS = [
@@ -92,6 +92,11 @@ def _as_county_code(series: pd.Series) -> pd.Series:
     return keys.map(lambda value: value.zfill(5) if value.isdigit() and len(value) < 5 else value)
 
 
+def _as_faf_zone_code(series: pd.Series) -> pd.Series:
+    keys = _as_key(series)
+    return keys.map(lambda value: str(int(value)) if value.isdigit() else value)
+
+
 def _as_number(series: pd.Series, column_name: str) -> pd.Series:
     values = pd.to_numeric(series, errors="coerce")
     if values.isna().any():
@@ -132,11 +137,11 @@ def load_truck_disaggregation_factors(
 
     origin = origin[["dms_orig", "origin_county", "sctgG5", "f_orig"]].copy()
     destination = destination[["dms_dest", "destination_county", "sctgG5", "f_dest"]].copy()
-    for col in ["dms_orig", "sctgG5"]:
-        origin[col] = _as_key(origin[col])
+    origin["dms_orig"] = _as_faf_zone_code(origin["dms_orig"])
+    origin["sctgG5"] = _as_key(origin["sctgG5"])
     origin["origin_county"] = _as_county_code(origin["origin_county"])
-    for col in ["dms_dest", "sctgG5"]:
-        destination[col] = _as_key(destination[col])
+    destination["dms_dest"] = _as_faf_zone_code(destination["dms_dest"])
+    destination["sctgG5"] = _as_key(destination["sctgG5"])
     destination["destination_county"] = _as_county_code(destination["destination_county"])
     origin["f_orig"] = _as_number(origin["f_orig"], "f_orig")
     destination["f_dest"] = _as_number(destination["f_dest"], "f_dest")
@@ -197,15 +202,16 @@ def _resolve_year_column(df: pd.DataFrame, base_name: str, year: int | str | Non
     return candidates[0] if candidates else None
 
 
-def load_faf_regional_od(
-    faf_od_path: str | Path,
+def _normalize_faf_od_frame(
+    faf_od: pd.DataFrame,
     year: int | str | None = None,
     mode: str | int | None = "truck",
     tons_unit: str = "thousand_tons",
+    faf_zone_filter: Iterable[str] | None = None,
 ) -> pd.DataFrame:
-    """Load and normalize FAF regional OD flows."""
+    """Normalize FAF regional OD columns in an in-memory frame."""
 
-    df = _read_table(faf_od_path)
+    df = _clean_columns(faf_od)
     df = _rename_first(df, ["dms_orig", "origin_faf", "origin_zone"], "origin_faf")
     df = _rename_first(df, ["dms_dest", "destination_faf", "destination_zone"], "destination_faf")
     df = _rename_first(df, ["sctg2", "sctg", "commodity"], "sctg")
@@ -245,8 +251,58 @@ def load_faf_regional_od(
     if mode_code is not None:
         mode_text = result["mode"].astype(str).str.strip().str.lower()
         result = result[(mode_text == str(mode_code).lower()) | (mode_text == str(mode).lower())].copy()
+    if faf_zone_filter is not None:
+        zones = {str(int(str(zone).strip())) if str(zone).strip().isdigit() else str(zone).strip() for zone in faf_zone_filter}
+        origin = _as_faf_zone_code(result["origin_faf"])
+        destination = _as_faf_zone_code(result["destination_faf"])
+        result = result[origin.isin(zones) | destination.isin(zones)].copy()
+    result["origin_faf"] = _as_faf_zone_code(result["origin_faf"])
+    result["destination_faf"] = _as_faf_zone_code(result["destination_faf"])
     result = result[result["tons"] > 0].reset_index(drop=True)
     return map_faf_sctg_to_sctgG5(result)
+
+
+def load_faf_regional_od(
+    faf_od_path: str | Path,
+    year: int | str | None = None,
+    mode: str | int | None = "truck",
+    tons_unit: str = "thousand_tons",
+    faf_zone_filter: Iterable[str] | None = None,
+    chunksize: int | None = None,
+) -> pd.DataFrame:
+    """Load and normalize FAF regional OD flows.
+
+    When ``chunksize`` is provided for CSV input, rows are streamed and filtered
+    before concatenation. This is useful for VA-scale runs from national FAF CSVs.
+    """
+
+    table_path = Path(faf_od_path)
+    if chunksize and table_path.suffix.lower() == ".csv":
+        pieces: list[pd.DataFrame] = []
+        for chunk in pd.read_csv(table_path, dtype=str, chunksize=chunksize, low_memory=False):
+            normalized = _normalize_faf_od_frame(
+                chunk,
+                year=year,
+                mode=mode,
+                tons_unit=tons_unit,
+                faf_zone_filter=faf_zone_filter,
+            )
+            if not normalized.empty:
+                pieces.append(normalized)
+        if not pieces:
+            return pd.DataFrame(
+                columns=["origin_faf", "destination_faf", "mode", "tons", "year", "sctg", "sctgG5", "value"]
+            )
+        return pd.concat(pieces, ignore_index=True)
+
+    df = _read_table(table_path)
+    return _normalize_faf_od_frame(
+        df,
+        year=year,
+        mode=mode,
+        tons_unit=tons_unit,
+        faf_zone_filter=faf_zone_filter,
+    )
 
 
 def _sctg_to_group(value: object) -> str:
@@ -267,6 +323,10 @@ def map_faf_sctg_to_sctgG5(faf_od: pd.DataFrame) -> pd.DataFrame:
     """Ensure a FAF OD table has BTS factor-compatible ``sctgG5`` groups."""
 
     result = faf_od.copy()
+    if "origin_faf" in result.columns:
+        result["origin_faf"] = _as_faf_zone_code(result["origin_faf"])
+    if "destination_faf" in result.columns:
+        result["destination_faf"] = _as_faf_zone_code(result["destination_faf"])
     if "sctgG5" not in result.columns or result["sctgG5"].isna().any():
         if "sctg" not in result.columns:
             raise ValueError("Cannot derive sctgG5 without an sctg/sctg2 column")
@@ -465,6 +525,8 @@ def run_county_disaggregation(
     payload_factors_path: str | Path | None = None,
     tons_unit: str = "thousand_tons",
     chunk_size: int = 10_000,
+    read_chunksize: int | None = None,
+    faf_zone_filter: Iterable[str] | None = None,
     annual_to_daily_factor: float = 365,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """Run the BTS county-factor workflow and write output."""
@@ -475,7 +537,14 @@ def run_county_disaggregation(
     bad_destination = int((~factor_validation["destination_factor_sums"]["within_tolerance"]).sum())
     if bad_origin or bad_destination:
         LOGGER.warning("Factor sums outside tolerance: origin=%s destination=%s", bad_origin, bad_destination)
-    faf_od = load_faf_regional_od(faf_od_path, year=year, mode=mode, tons_unit=tons_unit)
+    faf_od = load_faf_regional_od(
+        faf_od_path,
+        year=year,
+        mode=mode,
+        tons_unit=tons_unit,
+        faf_zone_filter=faf_zone_filter,
+        chunksize=read_chunksize,
+    )
     county_od = disaggregate_faf_to_county(
         faf_od,
         origin_factors,
@@ -505,6 +574,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--payload-factors", default=None, help="Optional payload factor CSV/parquet")
     parser.add_argument("--tons-unit", choices=["tons", "thousand_tons"], default="thousand_tons")
     parser.add_argument("--chunk-size", type=int, default=10_000)
+    parser.add_argument("--read-chunksize", type=int, default=None, help="CSV read chunksize for large FAF OD files")
+    parser.add_argument(
+        "--faf-zone-filter",
+        default=None,
+        help="Optional comma-separated FAF zones. Keeps rows where origin or destination is in the set.",
+    )
     parser.add_argument("--annual-to-daily-factor", type=float, default=365)
     parser.add_argument("--summary-json", default=None, help="Optional path for summary JSON")
     return parser
@@ -523,6 +598,8 @@ def main(argv: list[str] | None = None) -> int:
         payload_factors_path=args.payload_factors,
         tons_unit=args.tons_unit,
         chunk_size=args.chunk_size,
+        read_chunksize=args.read_chunksize,
+        faf_zone_filter=[zone.strip() for zone in args.faf_zone_filter.split(",")] if args.faf_zone_filter else None,
         annual_to_daily_factor=args.annual_to_daily_factor,
     )
     LOGGER.info("Wrote %s county OD rows to %s", len(county_od), args.output)

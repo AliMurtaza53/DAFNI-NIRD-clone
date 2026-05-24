@@ -14,6 +14,18 @@ Required:
 - BTS truck origin factor CSV, for example `All_Experimental_Disaggregation_Factors/truck_origin_factors.csv`.
 - BTS truck destination factor CSV, for example `All_Experimental_Disaggregation_Factors/truck_destination_factors.csv`.
 
+Current local raw data layout:
+
+```text
+C:\Users\alimu\NIRD_Data\faf5_data\
+├── regional_od_data\FAF5.7.1_2018-2024.csv
+├── network_data\FAF5Network.gdb
+├── regions_shp\Freight_Analysis_Framework_(FAF5)_Regions.shp
+└── county_disaggregation_factors\
+    ├── truck_origin_factors.csv
+    └── truck_destination_factors.csv
+```
+
 Optional:
 
 - Payload factor table with `sctgG5`, `truck_type`, and `payload_tons`.
@@ -59,7 +71,9 @@ python -m src.preprocess.faf5_county_disaggregation ^
   --destination-factors All_Experimental_Disaggregation_Factors\truck_destination_factors.csv ^
   --output data\processed\faf5_county_truck_od.csv ^
   --year 2022 ^
-  --mode truck
+  --mode truck ^
+  --read-chunksize 200000 ^
+  --faf-zone-filter 511,512,513,519
 ```
 
 The reusable implementation is `nird.faf5_county_disaggregation`, so this also works:
@@ -130,3 +144,13 @@ The county node map must contain `county_id,node_id`. If the county OD file alre
 - The BTS factors are experimental and public; they should be treated as an approximation.
 - County OD is not assignment-ready until counties are mapped to network nodes.
 - The first implementation chunks by FAF OD rows and is intended to work first for Virginia or filtered regional subsets before scaling to CONUS.
+- For Virginia tests from the national FAF CSV, use `--faf-zone-filter 511,512,513,519`; these are the Virginia FAF zones observed in the FAF5 network node centroids.
+
+The first VA-filtered 2022 run wrote:
+
+```text
+C:\Users\alimu\NIRD_Data\faf5_data\processed\faf5_county_truck_od_va_2022.parquet
+C:\Users\alimu\NIRD_Data\faf5_data\processed\faf5_county_truck_od_va_2022_summary.json
+```
+
+It preserves FAF tonnage within floating-point tolerance and currently includes all OD rows where either origin or destination FAF zone is in the Virginia set.

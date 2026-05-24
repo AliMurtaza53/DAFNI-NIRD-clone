@@ -130,6 +130,10 @@ def test_cli_workflow_writes_county_od_and_summary(tmp_path):
             str(payload_path),
             "--summary-json",
             str(summary_path),
+            "--read-chunksize",
+            "2",
+            "--faf-zone-filter",
+            "101",
         ]
     )
 
@@ -137,6 +141,27 @@ def test_cli_workflow_writes_county_od_and_summary(tmp_path):
     assert output_path.exists()
     assert summary_path.exists()
     assert pd.read_csv(output_path, dtype=str)["origin_county"].str.startswith("010").all()
+
+
+def test_load_faf_regional_od_streams_and_filters_csv(tmp_path):
+    faf_path = tmp_path / "faf.csv"
+    pd.DataFrame(
+        [
+            {"dms_orig": "101", "dms_dest": "201", "dms_mode": "1", "sctg2": "01", "tons_2022": "1"},
+            {"dms_orig": "301", "dms_dest": "401", "dms_mode": "1", "sctg2": "01", "tons_2022": "9"},
+        ]
+    ).to_csv(faf_path, index=False)
+
+    loaded = county.load_faf_regional_od(
+        faf_path,
+        year=2022,
+        mode="truck",
+        faf_zone_filter=["101"],
+        chunksize=1,
+    )
+
+    assert len(loaded) == 1
+    assert loaded.loc[0, "origin_faf"] == "101"
 
 
 def test_loader_pads_numeric_county_fips_without_casting(tmp_path):
@@ -153,3 +178,15 @@ def test_loader_pads_numeric_county_fips_without_casting(tmp_path):
 
     assert origin.loc[0, "origin_county"] == "01073"
     assert destination.loc[0, "destination_county"] == "10003"
+
+
+def test_faf_zone_ids_normalize_for_factor_joins():
+    origin, destination = factor_tables()
+    od = regional_od()
+    od.loc[0, "origin_faf"] = "0101"
+    od.loc[0, "destination_faf"] = "0201"
+
+    county_od = county.disaggregate_faf_to_county(od, origin, destination)
+
+    assert round(county_od["tons"].sum(), 6) == 1000.0
+    assert set(county_od["origin_faf"]) == {"101"}
