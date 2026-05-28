@@ -738,13 +738,22 @@ def find_least_cost_path(
         and the list of flows matching the inputs.
     """
     origin_node, destination_nodes, flows = params
-    paths = shared_network.get_shortest_paths(
-        v=origin_node,
-        to=destination_nodes,
-        weights="weight",
-        mode="out",
-        output="epath",
-    )  # paths: o - d(s)
+    dest_batch_size = int(os.environ.get("NIRD_SHORTEST_PATH_DEST_BATCH", "0"))
+    if dest_batch_size <= 0:
+        dest_batch_size = len(destination_nodes) if destination_nodes else 1
+
+    paths = []
+    for start in range(0, len(destination_nodes), dest_batch_size):
+        dest_batch = destination_nodes[start : start + dest_batch_size]
+        paths.extend(
+            shared_network.get_shortest_paths(
+                v=origin_node,
+                to=dest_batch,
+                weights="weight",
+                mode="out",
+                output="epath",
+            )
+        )  # paths: o - d(s)
 
     return (
         origin_node,
@@ -1305,7 +1314,8 @@ def network_flow_model(
 
         flow_batch: List[Tuple[str, str, List[int], float]] = []
         isolated_batch: List[Tuple[str, str, float]] = []
-        batch_size = 100_000
+        batch_size = int(os.environ.get("NIRD_FLOW_DB_BATCH_SIZE", "100000"))
+        logging.info(f"Flow DB insert batch size: {batch_size:,}")
 
         def flush_flow_batch() -> None:
             nonlocal flow_batch
@@ -1362,7 +1372,7 @@ def network_flow_model(
                     pool.imap_unordered(find_least_cost_path, args), start=1
                 ):
                     handle_shortest_path(shortest_path)
-                    if i % 10_000 == 0:
+                    if i == 1 or i % 10 == 0 or i == len(args):
                         logging.info(
                             f"Completed {i} of {len(args)}, {100 * i / len(args):.2f}%"
                         )
@@ -1373,7 +1383,7 @@ def network_flow_model(
                 (find_least_cost_path(arg) for arg in args), start=1
             ):
                 handle_shortest_path(shortest_path)
-                if i % 10_000 == 0:
+                if i == 1 or i % 10 == 0 or i == len(args):
                     logging.info(
                         f"Completed {i} of {len(args)}, {100 * i / len(args):.2f}%"
                     )

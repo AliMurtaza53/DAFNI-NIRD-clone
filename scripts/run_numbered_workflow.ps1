@@ -3,7 +3,9 @@ param(
     [int[]]$EventKeys = @(1, 2, 3),
     [int]$NumChunks = 20,
     [int]$NumCpu = 1,
-    [string]$Python = "python"
+    [string]$Python = "python",
+    [switch]$RunAlternateScript2,
+    [switch]$RunSensitivity
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,9 +13,6 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $repoRoot "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
-Remove-Item Env:NIRD_OD_MULTIPLIER -ErrorAction SilentlyContinue
-Remove-Item Env:NIRD_OD_TARGET_TOTAL -ErrorAction SilentlyContinue
 
 function Invoke-Step {
     param(
@@ -59,15 +58,21 @@ Push-Location $repoRoot
 try {
     Invoke-Step "script1_network_flow" @("scripts/1_network_flow_model_revision.py", "$NumChunks", "$NumCpu")
 
+    if ($RunAlternateScript2) {
+        foreach ($eventKey in $EventKeys) {
+            Invoke-Step "script2_alt_depth${DepthKey}_event${eventKey}" @("scripts/2_int_analysis.py", "$DepthKey", "$eventKey")
+        }
+    }
+
     foreach ($eventKey in $EventKeys) {
-        Invoke-Step "script2_depth${DepthKey}_event${eventKey}" @("scripts/2_intersection_analysis.py", "$DepthKey", "$eventKey")
+        Invoke-Step "script2_intersection_depth${DepthKey}_event${eventKey}" @("scripts/2_intersection_analysis.py", "$DepthKey", "$eventKey")
     }
 
     Invoke-Step "script3_damage_analysis" @("scripts/3_damage_analysis.py")
     Invoke-Step "script3_postprocess_damage" @("scripts/3_postprocess_damage.py")
 
     foreach ($eventKey in $EventKeys) {
-        Invoke-Step "script4_depth${DepthKey}_event${eventKey}" @(
+        Invoke-Step "script4_rerouting_depth${DepthKey}_event${eventKey}" @(
             "scripts/4_rerouting_and_recovery_scenario_loop.py",
             "$DepthKey",
             "$eventKey",
@@ -76,8 +81,13 @@ try {
         )
     }
 
+    if ($RunSensitivity) {
+        Invoke-Step "script5_sensitivity_direct" @("scripts/5_sensitivity_analysis_direct.py")
+        Invoke-Step "script5_sensitivity_indirect" @("scripts/5_sensitivity_analysis_indirect.py")
+    }
+
     Write-Host ""
-    Write-Host "Workflow completed successfully."
+    Write-Host "Numbered workflow completed successfully."
 }
 finally {
     Pop-Location

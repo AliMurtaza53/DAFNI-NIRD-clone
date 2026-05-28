@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 import time
 
@@ -63,7 +64,9 @@ def main(
         None: Outputs are saved to files.
     """
     start_time = time.time()
-    db_path = base_path / "dbs" / "baseline.duckdb"
+    db_path = Path(
+        os.environ.get("NIRD_BASELINE_DB_PATH") or base_path / "dbs" / "baseline.duckdb"
+    )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     logging.info(f"Database path is: {db_path}")
 

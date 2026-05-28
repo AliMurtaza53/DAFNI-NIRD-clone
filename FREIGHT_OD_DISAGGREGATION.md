@@ -50,6 +50,29 @@ Optional:
   --freight-tons-unit thousand_tons
 ```
 
+## Full-USA County OD Matrix
+
+For the current local FAF5 layout, read the OD file from `regional_od_data` and
+the truck county factors from `county_disaggregation_factors`. The CONUS runner
+streams directly to a total county-to-county matrix and does not use the
+IX/XI/XX/II treatment for smaller state or regional models:
+
+```powershell
+python -m nird.faf5_conus_county_od `
+  --year 2022 `
+  --mode truck
+```
+
+By default this uses:
+
+| Input/output | Path |
+|---|---|
+| FAF5 OD | `C:\Users\alimu\NIRD_Data\faf5_data\regional_od_data\FAF5.7.1_2018-2024.csv` |
+| Origin county factors | `C:\Users\alimu\NIRD_Data\faf5_data\county_disaggregation_factors\truck_origin_factors.csv` |
+| Destination county factors | `C:\Users\alimu\NIRD_Data\faf5_data\county_disaggregation_factors\truck_destination_factors.csv` |
+| Output matrix | `C:\Users\alimu\NIRD_Data\faf5_data\processed\faf5_county_truck_od_usa_2022_total.parquet` |
+| Summary | `C:\Users\alimu\NIRD_Data\faf5_data\processed\faf5_county_truck_od_usa_2022_total_summary.json` |
+
 ## Required Schemas
 
 ### FAF Flow Input

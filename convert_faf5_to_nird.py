@@ -25,6 +25,7 @@ import fiona
 
 # Road classification mapping: FAF5 Class -> NIRD coarse road_classification
 CLASS_MAPPING = {
+    # Legacy/simple FAF class codes seen in early test files.
     1: 'motorway',           # Interstate
     2: 'trunk',              # Principal Arterial - Freeways
     3: 'primary',            # Principal Arterial - Other
@@ -34,7 +35,22 @@ CLASS_MAPPING = {
     7: 'unclassified',       # Local
     8: 'motorway_link',      # Ramp
     9: 'service',            # Service/Frontage Road
+    # FAF5 V2021.05 network class codes.
+    11: 'motorway',          # Interstate Highway
+    12: 'trunk',             # Other Controlled Access Highway
+    13: 'motorway',          # Non-Freeway Interstate (Alaska)
+    14: 'primary',           # Arterial or Major Collector
+    15: 'tertiary',          # Local Road
+    16: 'service',           # Frontage/Service Road
+    17: 'service',           # Traffic Circle
+    18: 'service',           # Turn Lane
     19: 'service',           # Facility Access/Circulator
+    21: 'motorway_link',     # System Ramp
+    22: 'motorway_link',     # Ramp
+    23: 'primary',           # Collector/Distributor Lane
+    33: 'motorway',          # Express Lane (Truck)
+    36: 'service',           # Administrative/Service Road
+    41: 'service',           # Ferry
     50: 'centroid_connector' # Centroid connector (will be filtered)
 }
 
@@ -51,6 +67,20 @@ DETAIL_CLASS_MAPPING = {
     8: 'Ramp',
     9: 'Service/Frontage Road',
     19: 'Facility Access/Circulator',
+    11: 'Interstate Highway',
+    12: 'Other Controlled Access Highway',
+    13: 'Non-Freeway Interstate (Alaska)',
+    14: 'Arterial or Major Collector',
+    15: 'Local Road',
+    16: 'Frontage/Service Road',
+    17: 'Traffic Circle',
+    18: 'Turn Lane',
+    21: 'System Ramp',
+    22: 'Ramp',
+    23: 'Collector/Distributor Lane',
+    33: 'Express Lane (Truck)',
+    36: 'Administrative/Service Road',
+    41: 'Ferry',
     50: 'Centroid Connector',
 }
 
