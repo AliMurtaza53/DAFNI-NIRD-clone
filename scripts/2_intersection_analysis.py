@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 from collections import defaultdict
 import rasterio
+from shapely.geometry import box
 
 from snail import intersection
 from nird.utils import get_results_variant, load_config
@@ -137,6 +138,102 @@ def log_summary(label: str, gdf: gpd.GeoDataFrame) -> None:
     if "damage_level_max" in gdf.columns:
         counts = gdf["damage_level_max"].value_counts(dropna=False)
         logging.info(f"{label} damage_level_max counts: {counts.to_dict()}")
+
+
+def _is_us_national_atlas_alias(crs) -> bool:
+    """Return True for LOCAL_CS aliases of EPSG:2163 used by toy rasters."""
+    if crs is None:
+        return False
+    crs_text = str(crs)
+    return "US National Atlas Equal Area" in crs_text or "2163" in crs_text
+
+
+def subset_features_to_raster_extent(
+    features: gpd.GeoDataFrame,
+    flood_path: str,
+    padding_pixels: int = 2,
+) -> gpd.GeoDataFrame:
+    """Spatially prefilter features to the hazard raster footprint.
+
+    This avoids sending an entire national network into snail's split/intersection
+    routine when the hazard raster covers only a small test area.
+    """
+    if features.empty:
+        return features
+
+    with rasterio.Env(
+        PROJ_DATA=os.environ.get("PROJ_DATA"),
+        PROJ_LIB=os.environ.get("PROJ_LIB"),
+        GTIFF_SRS_SOURCE="EPSG",
+    ):
+        with rasterio.open(flood_path) as dataset:
+            bounds = dataset.bounds
+            raster_crs = dataset.crs
+            pad_x = abs(dataset.transform.a) * padding_pixels
+            pad_y = abs(dataset.transform.e) * padding_pixels
+
+    extent_geom = box(
+        bounds.left - pad_x,
+        bounds.bottom - pad_y,
+        bounds.right + pad_x,
+        bounds.top + pad_y,
+    )
+
+    if raster_crs is None:
+        logging.warning(
+            "Raster has no CRS; skipping raster-extent feature prefilter for %s",
+            flood_path,
+        )
+        return features
+
+    extent = gpd.GeoDataFrame({"source": [Path(flood_path).name]}, geometry=[extent_geom], crs=raster_crs)
+    if features.crs is None:
+        logging.warning(
+            "Road links have no CRS; skipping raster-extent feature prefilter for %s",
+            flood_path,
+        )
+        return features
+
+    if extent.crs != features.crs:
+        try:
+            extent = extent.to_crs(features.crs)
+        except Exception as exc:
+            if _is_us_national_atlas_alias(raster_crs) and _is_us_national_atlas_alias(features.crs):
+                logging.warning(
+                    "Raster CRS is a US National Atlas alias; applying raster bounds in feature CRS "
+                    "without reprojection."
+                )
+                extent = gpd.GeoDataFrame(
+                    {"source": [Path(flood_path).name]},
+                    geometry=[extent_geom],
+                    crs=features.crs,
+                )
+            else:
+                raise RuntimeError(
+                    "Could not transform raster extent to road-link CRS for prefiltering. "
+                    f"Raster={flood_path}; details: {exc}"
+                ) from exc
+
+    before = len(features)
+    extent_polygon = extent.geometry.iloc[0]
+    try:
+        candidate_idx = features.sindex.query(extent_polygon, predicate="intersects")
+        filtered = features.iloc[np.unique(candidate_idx)].copy()
+    except Exception:
+        filtered = features[features.intersects(extent_polygon)].copy()
+
+    logging.info(
+        "Raster extent prefilter for %s: %s -> %s road links",
+        Path(flood_path).name,
+        before,
+        len(filtered),
+    )
+    if filtered.empty:
+        logging.warning(
+            "Raster extent prefilter found no road links for %s; downstream output may be empty.",
+            flood_path,
+        )
+    return filtered
 
 
 def load_analysis_boundary(base_path: Path) -> gpd.GeoDataFrame:
@@ -743,8 +840,12 @@ def intersections_with_damage(
             and damage levels.
     """
 
-    # Clip road links with features in the provided vector file
-    clipped_features = clip_features(road_links, clip_path, flood_key, boundary_gdf)
+    # First restrict to the raster footprint so national-scale networks do not
+    # enter the expensive line-splitting/intersection path for a local hazard.
+    candidate_links = subset_features_to_raster_extent(road_links, flood_path)
+
+    # Clip road links with features in the provided vector file/boundary.
+    clipped_features = clip_features(candidate_links, clip_path, flood_key, boundary_gdf)
     if clipped_features.empty:
         logging.info("Warning: Clip features is None!")
         return None
