@@ -783,6 +783,744 @@ def worker_init_path(
     return None
 
 
+def _append_or_create_table(
+    conn,
+    table_name: str,
+    df: pd.DataFrame,
+    registered_name: str,
+) -> None:
+    """Append a DataFrame into DuckDB, creating the target table on first use."""
+    conn.register(registered_name, df)
+    exists = (
+        conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_name = ?
+            """,
+            [table_name],
+        ).fetchone()[0]
+        > 0
+    )
+    if exists:
+        conn.execute(f"INSERT INTO {table_name} SELECT * FROM {registered_name}")
+    else:
+        conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM {registered_name}")
+    conn.unregister(registered_name)
+
+
+def _sql_path(path: str) -> str:
+    """Return a DuckDB-safe path for single-quoted SQL strings."""
+    return str(path).replace("\\", "/").replace("'", "''")
+
+
+def _safe_event_id(value) -> str:
+    """Normalize event identifiers for folder names."""
+    text = str(value).strip() if value is not None else "event_000001"
+    if not text:
+        text = "event_000001"
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+
+
+def load_event_damaged_edges(
+    damaged_edges_path: Optional[str],
+    network,
+) -> Tuple[Dict[str, Dict[int, str]], Dict[int, List[str]], pd.DataFrame]:
+    """Load event damaged edges and map edge IDs to igraph edge indices.
+
+    The input may be CSV or Parquet and must contain ``e_id`` plus either
+    ``event_id`` or a depth/flood key pair. Missing optional damage columns are
+    tolerated because path filtering only needs edge membership.
+    """
+    if damaged_edges_path is None or str(damaged_edges_path).strip() == "":
+        logging.info("No event damaged-edge file provided.")
+        return {}, {}, pd.DataFrame(columns=["event_id", "e_id", "edge_idx"])
+
+    damaged_path = str(damaged_edges_path)
+    if not os.path.exists(damaged_path):
+        raise FileNotFoundError(f"Event damaged-edge file not found: {damaged_path}")
+
+    if damaged_path.lower().endswith((".pq", ".parquet")):
+        damaged_df = pd.read_parquet(damaged_path)
+    else:
+        damaged_df = pd.read_csv(damaged_path)
+    if damaged_df.empty:
+        logging.warning("Event damaged-edge file is empty: %s", damaged_path)
+        return {}, {}, pd.DataFrame(columns=["event_id", "e_id", "edge_idx"])
+    if "e_id" not in damaged_df.columns:
+        raise ValueError("Event damaged-edge file must contain an e_id column")
+
+    if "event_id" not in damaged_df.columns:
+        if {"depth_key", "flood_key"}.issubset(damaged_df.columns):
+            damaged_df["event_id"] = (
+                damaged_df["depth_key"].astype(str)
+                + "_"
+                + damaged_df["flood_key"].astype(str)
+            )
+        elif "flood_key" in damaged_df.columns:
+            damaged_df["event_id"] = damaged_df["flood_key"].astype(str)
+        elif "depth_key" in damaged_df.columns:
+            damaged_df["event_id"] = damaged_df["depth_key"].astype(str)
+        else:
+            damaged_df["event_id"] = "event_000001"
+
+    edge_idx_by_eid = {str(eid): idx for idx, eid in enumerate(network.es["e_id"])}
+    damaged_df = damaged_df[["event_id", "e_id"]].copy()
+    damaged_df["event_id"] = damaged_df["event_id"].map(_safe_event_id)
+    damaged_df["e_id"] = damaged_df["e_id"].astype(str)
+    damaged_df["edge_idx"] = damaged_df["e_id"].map(edge_idx_by_eid)
+    missing_count = int(damaged_df["edge_idx"].isna().sum())
+    if missing_count:
+        logging.warning(
+            "Event damaged-edge loader skipped %s e_id values not present in network.",
+            missing_count,
+        )
+    damaged_df = damaged_df.dropna(subset=["edge_idx"]).drop_duplicates(
+        ["event_id", "edge_idx"]
+    )
+    damaged_df["edge_idx"] = damaged_df["edge_idx"].astype(int)
+
+    event_edges: Dict[str, Dict[int, str]] = defaultdict(dict)
+    edge_events: Dict[int, List[str]] = defaultdict(list)
+    for row in damaged_df.itertuples(index=False):
+        event_edges[row.event_id][int(row.edge_idx)] = str(row.e_id)
+        edge_events[int(row.edge_idx)].append(row.event_id)
+
+    logging.info(
+        "Loaded %s event(s), %s event-edge rows, %s unique damaged edges from %s.",
+        len(event_edges),
+        len(damaged_df),
+        damaged_df["edge_idx"].nunique() if not damaged_df.empty else 0,
+        damaged_path,
+    )
+    for event_id, edges in event_edges.items():
+        logging.info("Event %s damaged edges: %s", event_id, len(edges))
+
+    return dict(event_edges), dict(edge_events), damaged_df
+
+
+def _write_candidate_part(
+    event_dir: str,
+    part_index: int,
+    rows: List[Tuple],
+    columns: List[str],
+) -> str:
+    part_dir = os.path.join(event_dir, "parts")
+    os.makedirs(part_dir, exist_ok=True)
+    part_path = os.path.join(part_dir, f"candidates_part_{part_index:06d}.pq")
+    pd.DataFrame(rows, columns=columns).to_parquet(part_path, index=False)
+    return part_path
+
+
+def write_event_disrupted_candidates(
+    conn,
+    network,
+    damaged_edges_path: Optional[str],
+    out_dir: str,
+    time_expr: str,
+    fare_expr: str,
+    chunk_size: int,
+    iter_flag: int,
+    combine_parts: bool = False,
+) -> Dict[str, Dict[str, int]]:
+    """Write only OD rows whose path intersects event damaged edges."""
+    event_edges, edge_events, _ = load_event_damaged_edges(damaged_edges_path, network)
+    if not event_edges:
+        logging.warning("No event damaged edges loaded; event candidate output is empty.")
+        return {}
+
+    candidates_root = os.path.join(out_dir, "event_disrupted_candidates")
+    os.makedirs(candidates_root, exist_ok=True)
+    total_rows = conn.execute("SELECT COUNT(*) FROM temp_flow_matrix_input").fetchone()[0] or 0
+    chunk_size = max(1, int(chunk_size))
+    edge_eid = np.asarray(network.es["e_id"], dtype=object)
+    candidate_columns = [
+        "od_id",
+        "origin_node",
+        "destination_node",
+        "flow",
+        "path",
+        "flood_links",
+        "operating_cost_per_flow",
+        "time_cost_per_flow",
+        "toll_cost_per_flow",
+        "fare_cost_per_flow",
+        "length_mile",
+    ]
+    buffers: Dict[str, List[Tuple]] = defaultdict(list)
+    summary: Dict[str, Dict[str, int]] = {
+        event_id: {"rows": 0, "parts": 0} for event_id in event_edges
+    }
+    max_buffer_rows = int(os.environ.get("NIRD_EVENT_CANDIDATE_BUFFER_ROWS", "50000"))
+    filter_start = time.time()
+
+    def flush_event(event_id: str) -> None:
+        rows = buffers[event_id]
+        if not rows:
+            return
+        event_dir = os.path.join(candidates_root, event_id)
+        part_path = _write_candidate_part(
+            event_dir,
+            summary[event_id]["parts"] + 1,
+            rows,
+            candidate_columns,
+        )
+        summary[event_id]["rows"] += len(rows)
+        summary[event_id]["parts"] += 1
+        logging.info(
+            "Wrote event candidate part for event=%s rows=%s path=%s",
+            event_id,
+            len(rows),
+            part_path,
+        )
+        buffers[event_id] = []
+
+    logging.info(
+        "Filtering event disrupted candidates for iteration %s over %s OD paths.",
+        iter_flag,
+        total_rows,
+    )
+    for start in tqdm(
+        range(0, total_rows, chunk_size),
+        desc="Writing event candidates:",
+        unit="chunk",
+    ):
+        chunk = conn.execute(
+            f"""
+            SELECT
+                i.od_id,
+                i.origin,
+                i.destination,
+                i.path AS path_idx,
+                m.e_id AS path,
+                m.flow,
+                m.fuel,
+                {time_expr} AS time,
+                m.toll,
+                {fare_expr} AS fare,
+                m.length_mile
+            FROM (
+                SELECT od_id, origin, destination, path
+                FROM temp_flow_matrix_input
+                LIMIT {chunk_size}
+                OFFSET {start}
+            ) i
+            JOIN temp_flow_matrix m USING (od_id, origin, destination)
+            """
+        ).fetchdf()
+        if chunk.empty:
+            continue
+        for row in chunk.itertuples(index=False):
+            path_idx = [int(v) for v in list(row.path_idx)]
+            touched: Dict[str, List[int]] = defaultdict(list)
+            for idx in path_idx:
+                for event_id in edge_events.get(idx, []):
+                    touched[event_id].append(idx)
+            if not touched:
+                continue
+            path_eids = [str(e) for e in list(row.path)]
+            for event_id, hit_indices in touched.items():
+                event_edge_lookup = event_edges[event_id]
+                flood_links = [
+                    event_edge_lookup[idx]
+                    for idx in hit_indices
+                    if idx in event_edge_lookup
+                ]
+                buffers[event_id].append(
+                    (
+                        int(row.od_id),
+                        str(row.origin),
+                        str(row.destination),
+                        float(row.flow),
+                        path_eids,
+                        flood_links,
+                        float(row.fuel),
+                        float(row.time),
+                        float(row.toll),
+                        float(row.fare),
+                        float(row.length_mile),
+                    )
+                )
+                if len(buffers[event_id]) >= max_buffer_rows:
+                    flush_event(event_id)
+        del chunk
+        gc.collect()
+
+    for event_id in list(buffers):
+        flush_event(event_id)
+
+    for event_id in event_edges:
+        event_dir = os.path.join(candidates_root, event_id)
+        parts_dir = os.path.join(event_dir, "parts")
+        if combine_parts and summary[event_id]["parts"] > 0:
+            combined_path = os.path.join(event_dir, "disrupted_candidates.pq")
+            conn.execute(
+                f"""
+                COPY (
+                    SELECT *
+                    FROM read_parquet('{_sql_path(os.path.join(parts_dir, "*.pq"))}')
+                ) TO '{_sql_path(combined_path)}' (FORMAT PARQUET);
+                """
+            )
+            logging.info("Combined event candidate parts for %s into %s", event_id, combined_path)
+        output_size = 0
+        if os.path.isdir(parts_dir):
+            output_size = sum(
+                os.path.getsize(os.path.join(parts_dir, name))
+                for name in os.listdir(parts_dir)
+                if name.endswith(".pq")
+            )
+        logging.info(
+            "Event candidate summary: event=%s rows=%s parts=%s output_bytes=%s",
+            event_id,
+            summary[event_id]["rows"],
+            summary[event_id]["parts"],
+            output_size,
+        )
+    logging.info(
+        "Event filtering complete in %.2f seconds. Full odpfc skipped; global path_index skipped.",
+        time.time() - filter_start,
+    )
+    return summary
+
+
+def realize_paths_streaming(
+    network,
+    road_links,
+    conn,
+    temp_flow_table: str = "temp_flow_matrix_input",
+    od_output_table: str = "temp_flow_matrix",
+    edge_output_table: str = "temp_edge_flow",
+    chunk_size: int = 100_000,
+    persist_debug_tables: bool = False,
+    create_full_temp_flow_matrix: bool = True,
+    event_candidates_out_dir: Optional[str] = None,
+    damaged_edges_path: Optional[str] = None,
+    combine_event_candidate_parts: bool = False,
+    vehicle_type: str = "car",
+) -> None:
+    """Realize OD paths with streaming arrays instead of global path-edge expansion.
+
+    This preserves the current assignment semantics: edge ratios are computed from
+    unadjusted candidate edge flow, OD flow is scaled by the minimum edge ratio on
+    its path, and adjusted edge flow is accumulated from those adjusted OD flows.
+    """
+
+    total_rows = (
+        conn.execute(f"SELECT COUNT(*) FROM {temp_flow_table}").fetchone()[0] or 0
+    )
+    if total_rows == 0:
+        logging.info("No rows available for streaming path realization; skipping.")
+        return
+
+    chunk_size = max(1, int(chunk_size))
+    logging.info(
+        "Streaming path realization over %s OD path rows in chunks of %s rows.",
+        total_rows,
+        chunk_size,
+    )
+
+    edges = network.es
+    edge_eid = np.asarray(edges["e_id"], dtype=object)
+    edge_time = np.asarray(edges["time_cost"], dtype=np.float64)
+    edge_fuel = np.asarray(edges["operating_cost"], dtype=np.float64)
+    edge_toll = np.asarray(edges["average_toll_cost"], dtype=np.float64)
+    edge_length = np.asarray(edges["length_mile"], dtype=np.float64)
+    edge_count = len(edge_eid)
+
+    cap_by_eid = road_links.set_index("e_id")["acc_capacity"].to_dict()
+    edge_capacity = np.asarray(
+        [cap_by_eid.get(eid, 0.0) for eid in edge_eid],
+        dtype=np.float64,
+    )
+
+    edge_total_flow = np.zeros(edge_count, dtype=np.float64)
+    adjusted_edge_flow = np.zeros(edge_count, dtype=np.float64)
+    pass1_start = time.time()
+
+    for table in [
+        od_output_table,
+        edge_output_table,
+        "od_results_iter",
+        "od_adjustment",
+        "temp_edge_flow",
+        "temp_flow_matrix",
+        "temp_od_assignment",
+        "temp_iteration_costs",
+    ]:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+
+    od_columns = [
+        "od_id",
+        "origin",
+        "destination",
+        "e_id",
+        "flow",
+        "fuel",
+        "time",
+        "toll",
+        "length_mile",
+    ]
+
+    for start in tqdm(
+        range(0, total_rows, chunk_size),
+        desc="Streaming realization pass 1:",
+        unit="chunk",
+    ):
+        chunk = conn.execute(
+            f"""
+            SELECT od_id, origin, destination, path, flow
+            FROM {temp_flow_table}
+            LIMIT {chunk_size}
+            OFFSET {start}
+            """
+        ).fetchdf()
+        if chunk.empty:
+            continue
+
+        out_rows = []
+        for row in chunk.itertuples(index=False):
+            path = np.asarray(row.path, dtype=np.int64)
+            flow = float(row.flow) if row.flow is not None else 0.0
+            if path.size == 0:
+                continue
+            np.add.at(edge_total_flow, path, flow)
+            if create_full_temp_flow_matrix:
+                out_rows.append(
+                    (
+                        int(row.od_id),
+                        str(row.origin),
+                        str(row.destination),
+                        edge_eid[path].tolist(),
+                        flow,
+                        float(edge_fuel[path].sum()),
+                        float(edge_time[path].sum()),
+                        float(edge_toll[path].sum()),
+                        float(edge_length[path].sum()),
+                    )
+                )
+
+        if out_rows:
+            od_df = pd.DataFrame(out_rows, columns=od_columns)
+            _append_or_create_table(conn, "od_results_iter", od_df, "od_results_tmp")
+        del chunk
+        gc.collect()
+    logging.info(
+        "Streaming realization pass 1 complete in %.2f seconds. "
+        "create_full_temp_flow_matrix=%s.",
+        time.time() - pass1_start,
+        create_full_temp_flow_matrix,
+    )
+
+    edge_ratio = np.ones(edge_count, dtype=np.float64)
+    mask = edge_total_flow > 0
+    edge_ratio[mask] = np.minimum(
+        edge_capacity[mask] / np.where(edge_total_flow[mask] == 0, 1, edge_total_flow[mask]),
+        1.0,
+    )
+
+    adj_columns = ["od_id", "origin", "destination", "adjust_r"]
+    assignment_columns = ["origin", "destination", "flow"]
+    event_edges: Dict[str, Dict[int, str]] = {}
+    edge_events: Dict[int, List[str]] = {}
+    candidate_columns = [
+        "od_id",
+        "origin_node",
+        "destination_node",
+        "flow",
+        "path",
+        "flood_links",
+        "operating_cost_per_flow",
+        "time_cost_per_flow",
+        "toll_cost_per_flow",
+        "fare_cost_per_flow",
+        "length_mile",
+    ]
+    candidate_buffers: Dict[str, List[Tuple]] = defaultdict(list)
+    candidate_summary: Dict[str, Dict[str, int]] = {}
+    candidate_write_seconds = 0.0
+    if not create_full_temp_flow_matrix and event_candidates_out_dir and damaged_edges_path:
+        event_edges, edge_events, _ = load_event_damaged_edges(damaged_edges_path, network)
+        candidate_summary = {
+            event_id: {"rows": 0, "parts": 0} for event_id in event_edges
+        }
+        os.makedirs(
+            os.path.join(event_candidates_out_dir, "event_disrupted_candidates"),
+            exist_ok=True,
+        )
+        logging.info(
+            "Patch 5 fused event-candidate writing enabled inside streaming pass 2."
+        )
+    elif not create_full_temp_flow_matrix:
+        logging.info(
+            "Full temp_flow_matrix is disabled and no event-candidate file was provided; "
+            "streaming will write compact assignment/cost tables only."
+        )
+
+    max_buffer_rows = int(os.environ.get("NIRD_EVENT_CANDIDATE_BUFFER_ROWS", "50000"))
+
+    def flush_candidate_event(event_id: str) -> None:
+        nonlocal candidate_write_seconds
+        rows = candidate_buffers[event_id]
+        if not rows:
+            return
+        write_start = time.time()
+        event_dir = os.path.join(
+            event_candidates_out_dir,
+            "event_disrupted_candidates",
+            event_id,
+        )
+        part_path = _write_candidate_part(
+            event_dir,
+            candidate_summary[event_id]["parts"] + 1,
+            rows,
+            candidate_columns,
+        )
+        candidate_write_seconds += time.time() - write_start
+        candidate_summary[event_id]["rows"] += len(rows)
+        candidate_summary[event_id]["parts"] += 1
+        logging.info(
+            "Wrote fused event candidate part for event=%s rows=%s path=%s",
+            event_id,
+            len(rows),
+            part_path,
+        )
+        candidate_buffers[event_id] = []
+
+    cost_fuel_total = 0.0
+    cost_time_total = 0.0
+    cost_toll_total = 0.0
+    cost_fare_total = 0.0
+    assigned_flow_total = 0.0
+    pass2_start = time.time()
+    for start in tqdm(
+        range(0, total_rows, chunk_size),
+        desc="Streaming realization pass 2:",
+        unit="chunk",
+    ):
+        chunk = conn.execute(
+            f"""
+            SELECT od_id, origin, destination, path, flow
+            FROM {temp_flow_table}
+            LIMIT {chunk_size}
+            OFFSET {start}
+            """
+        ).fetchdf()
+        if chunk.empty:
+            continue
+
+        adj_rows = []
+        assignment_rows = []
+        for row in chunk.itertuples(index=False):
+            path = np.asarray(row.path, dtype=np.int64)
+            flow = float(row.flow) if row.flow is not None else 0.0
+            origin = str(row.origin)
+            destination = str(row.destination)
+            if path.size == 0:
+                adjust_r = 1.0
+                assigned_flow = flow
+                fuel = time_cost = toll = length_mile = 0.0
+            else:
+                adjust_r = float(edge_ratio[path].min())
+                assigned_flow = flow * adjust_r
+                np.add.at(adjusted_edge_flow, path, assigned_flow)
+                fuel = float(edge_fuel[path].sum())
+                time_cost = float(edge_time[path].sum())
+                toll = float(edge_toll[path].sum())
+                length_mile = float(edge_length[path].sum())
+            if create_full_temp_flow_matrix:
+                adj_rows.append((int(row.od_id), origin, destination, adjust_r))
+            else:
+                assignment_rows.append((origin, destination, assigned_flow))
+                if vehicle_type == "psv":
+                    adjusted_time_cost = (
+                        time_cost + 0.25 * cons.VOT_POUND_PER_HOUR[vehicle_type]
+                    )
+                    fare = min(2.0 + 0.15 * length_mile * cons.CONV_MILE_TO_KM, 4.5)
+                elif vehicle_type == "rail":
+                    adjusted_time_cost = (
+                        time_cost + 0.15 * cons.VOT_POUND_PER_HOUR[vehicle_type]
+                    )
+                    fare = min(3.0 + 0.2 * length_mile * cons.CONV_MILE_TO_KM, 250.0)
+                else:
+                    adjusted_time_cost = time_cost
+                    fare = 0.0
+                assigned_flow_total += assigned_flow
+                cost_fuel_total += assigned_flow * fuel
+                cost_time_total += assigned_flow * adjusted_time_cost
+                cost_toll_total += assigned_flow * toll
+                cost_fare_total += assigned_flow * fare
+
+                if event_edges and path.size > 0:
+                    touched: Dict[str, List[int]] = defaultdict(list)
+                    for idx in path.tolist():
+                        for event_id in edge_events.get(int(idx), []):
+                            touched[event_id].append(int(idx))
+                    if touched:
+                        path_eids = [str(e) for e in edge_eid[path].tolist()]
+                        for event_id, hit_indices in touched.items():
+                            event_edge_lookup = event_edges[event_id]
+                            flood_links = [
+                                event_edge_lookup[idx]
+                                for idx in hit_indices
+                                if idx in event_edge_lookup
+                            ]
+                            candidate_buffers[event_id].append(
+                                (
+                                    int(row.od_id),
+                                    origin,
+                                    destination,
+                                    assigned_flow,
+                                    path_eids,
+                                    flood_links,
+                                    fuel,
+                                    adjusted_time_cost,
+                                    toll,
+                                    fare,
+                                    length_mile,
+                                )
+                            )
+                            if len(candidate_buffers[event_id]) >= max_buffer_rows:
+                                flush_candidate_event(event_id)
+
+        if adj_rows:
+            adj_df = pd.DataFrame(adj_rows, columns=adj_columns)
+            _append_or_create_table(conn, "od_adjustment", adj_df, "od_adjust_tmp")
+        if assignment_rows:
+            assignment_df = pd.DataFrame(assignment_rows, columns=assignment_columns)
+            _append_or_create_table(
+                conn,
+                "temp_od_assignment",
+                assignment_df,
+                "temp_od_assignment_tmp",
+            )
+        del chunk
+        gc.collect()
+
+    if create_full_temp_flow_matrix:
+        conn.execute(
+            f"""
+            CREATE OR REPLACE TEMP TABLE {od_output_table} AS
+            SELECT
+                o.od_id,
+                o.origin,
+                o.destination,
+                o.e_id,
+                o.flow * COALESCE(a.adjust_r, 1.0) AS flow,
+                o.fuel,
+                o.time,
+                o.toll,
+                o.length_mile
+            FROM od_results_iter o
+            LEFT JOIN od_adjustment a USING (od_id, origin, destination);
+            """
+        )
+    else:
+        for event_id in list(candidate_buffers):
+            flush_candidate_event(event_id)
+        for event_id in event_edges:
+            event_dir = os.path.join(
+                event_candidates_out_dir,
+                "event_disrupted_candidates",
+                event_id,
+            )
+            parts_dir = os.path.join(event_dir, "parts")
+            if combine_event_candidate_parts and candidate_summary[event_id]["parts"] > 0:
+                combined_path = os.path.join(event_dir, "disrupted_candidates.pq")
+                conn.execute(
+                    f"""
+                    COPY (
+                        SELECT *
+                        FROM read_parquet('{_sql_path(os.path.join(parts_dir, "*.pq"))}')
+                    ) TO '{_sql_path(combined_path)}' (FORMAT PARQUET);
+                    """
+                )
+                logging.info(
+                    "Combined fused event candidate parts for %s into %s",
+                    event_id,
+                    combined_path,
+                )
+            output_size = 0
+            if os.path.isdir(parts_dir):
+                output_size = sum(
+                    os.path.getsize(os.path.join(parts_dir, name))
+                    for name in os.listdir(parts_dir)
+                    if name.endswith(".pq")
+                )
+            logging.info(
+                "Fused event candidate summary: event=%s rows=%s parts=%s output_bytes=%s",
+                event_id,
+                candidate_summary[event_id]["rows"],
+                candidate_summary[event_id]["parts"],
+                output_size,
+            )
+        costs_df = pd.DataFrame(
+            [
+                {
+                    "fuel_cost_total": cost_fuel_total,
+                    "time_cost_total": cost_time_total,
+                    "toll_cost_total": cost_toll_total,
+                    "fare_cost_total": cost_fare_total,
+                    "assigned_flow_total": assigned_flow_total,
+                }
+            ]
+        )
+        conn.register("temp_iteration_costs_df", costs_df)
+        conn.execute(
+            "CREATE OR REPLACE TEMP TABLE temp_iteration_costs AS SELECT * FROM temp_iteration_costs_df"
+        )
+        conn.unregister("temp_iteration_costs_df")
+        logging.info(
+            "Full temp_flow_matrix skipped. temp_od_assignment rows=%s, "
+            "assigned_flow_total=%s, cost totals fuel=%s time=%s toll=%s fare=%s.",
+            conn.execute("SELECT COUNT(*) FROM temp_od_assignment").fetchone()[0],
+            assigned_flow_total,
+            cost_fuel_total,
+            cost_time_total,
+            cost_toll_total,
+            cost_fare_total,
+        )
+    logging.info(
+        "Streaming realization pass 2 complete in %.2f seconds; candidate write time %.2f seconds.",
+        time.time() - pass2_start,
+        candidate_write_seconds,
+    )
+
+    edge_df = pd.DataFrame(
+        {
+            "e_id": edge_eid.tolist(),
+            "flow": adjusted_edge_flow,
+            "total_candidate_flow": edge_total_flow,
+            "acc_capacity": edge_capacity,
+            "edge_ratio": edge_ratio,
+        }
+    )
+    edge_df = edge_df[
+        (edge_df["flow"] > 0) | (edge_df["total_candidate_flow"] > 0)
+    ].reset_index(drop=True)
+    conn.register("temp_edge_flow_df", edge_df)
+    conn.execute(
+        f"CREATE OR REPLACE TEMP TABLE {edge_output_table} AS SELECT * FROM temp_edge_flow_df"
+    )
+    conn.unregister("temp_edge_flow_df")
+
+    if not persist_debug_tables:
+        conn.execute("DROP TABLE IF EXISTS od_adjustment")
+
+    od_rows = (
+        conn.execute(f"SELECT COUNT(*) FROM {od_output_table}").fetchone()[0]
+        if create_full_temp_flow_matrix
+        else conn.execute("SELECT COUNT(*) FROM temp_od_assignment").fetchone()[0]
+    )
+    logging.info(
+        "Streaming path realization complete: %s OD rows, %s edge rows. "
+        "full_temp_flow_matrix_created=%s",
+        od_rows,
+        conn.execute(f"SELECT COUNT(*) FROM {edge_output_table}").fetchone()[0],
+        create_full_temp_flow_matrix,
+    )
+
+
 def itter_path(
     network,
     road_links,
@@ -791,6 +1529,11 @@ def itter_path(
     db_path: str = "results.duckdb",
     conn=None,
     temp_flow_table: Optional[str] = None,
+    create_full_temp_flow_matrix: bool = True,
+    event_candidates_out_dir: Optional[str] = None,
+    damaged_edges_path: Optional[str] = None,
+    combine_event_candidate_parts: bool = False,
+    vehicle_type: str = "car",
 ) -> None:
     """Explode stored paths in chunks and accumulate edge flows in DuckDB.
 
@@ -861,8 +1604,34 @@ def itter_path(
     )  # network attributes
     conn.execute("DROP TABLE IF EXISTS od_results_iter")  # reset table
     conn.execute("DROP TABLE IF EXISTS edge_flows")  # reset table
+    conn.execute("DROP TABLE IF EXISTS total")
+    conn.execute("DROP TABLE IF EXISTS edge_total_parts")
+    conn.execute("DROP TABLE IF EXISTS od_adjustment_parts")
+    conn.execute("DROP TABLE IF EXISTS temp_flow_indexed")
+    conn.execute("DROP TABLE IF EXISTS temp_flow_matrix")
 
     if temp_flow_table is not None:
+        path_strategy = os.environ.get(
+            "NIRD_PATH_REALIZATION_STRATEGY", "legacy_compact_sql"
+        ).strip().lower()
+        if path_strategy in {"streaming_arrays", "streaming"}:
+            realize_paths_streaming(
+                network,
+                road_links,
+                conn,
+                temp_flow_table=temp_flow_table,
+                od_output_table="temp_flow_matrix",
+                edge_output_table="temp_edge_flow",
+                chunk_size=chunk_size,
+                create_full_temp_flow_matrix=create_full_temp_flow_matrix,
+                event_candidates_out_dir=event_candidates_out_dir,
+                damaged_edges_path=damaged_edges_path,
+                combine_event_candidate_parts=combine_event_candidate_parts,
+                vehicle_type=vehicle_type,
+            )
+            # Keep compact output tables available for downstream assignment updates.
+            return
+
         edges_sql = edges_df.reset_index()
         road_caps_sql = road_links[["e_id", "acc_capacity"]].copy()
         conn.register("edges_sql", edges_sql)
@@ -871,6 +1640,536 @@ def itter_path(
         conn.execute("CREATE OR REPLACE TEMP TABLE road_caps AS SELECT * FROM road_caps_sql")
         conn.unregister("edges_sql")
         conn.unregister("road_caps_sql")
+
+        compact_duckdb = os.environ.get(
+            "NIRD_DUCKDB_COMPACT_PATH_AGG", "1"
+        ).strip().lower() in {"1", "true", "yes"}
+        if path_strategy in {"legacy_compact_sql", "compact_sql", "compact_duckdb", "option1"} and compact_duckdb:
+            logging.info(
+                "Aggregating path costs and edge totals in DuckDB without "
+                "materializing exploded_paths..."
+            )
+            conn.execute(
+                f"""
+                CREATE TABLE total AS
+                SELECT
+                    e.e_id,
+                    MAX(r.acc_capacity) AS acc_capacity,
+                    SUM(t.flow) AS total_flow
+                FROM {temp_flow_table} t
+                CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                JOIN edge_attrs e
+                  ON e.path = u.path_idx
+                LEFT JOIN road_caps r
+                  ON r.e_id = e.e_id
+                GROUP BY e.e_id;
+                """
+            )
+            logging.info("Computed compact edge total-flow table.")
+
+            conn.execute(
+                f"""
+                CREATE TABLE od_results_iter AS
+                SELECT
+                    FIRST(t.od_id) AS od_id,
+                    t.origin,
+                    t.destination,
+                    LIST(e.e_id ORDER BY u.ord) AS e_id,
+                    FIRST(t.flow) AS flow,
+                    SUM(e.fuel) AS fuel,
+                    SUM(e.time) AS time,
+                    SUM(e.toll) AS toll,
+                    SUM(e.length_mile) AS length_mile
+                FROM {temp_flow_table} t
+                CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                JOIN edge_attrs e
+                  ON e.path = u.path_idx
+                GROUP BY t.od_id, t.origin, t.destination;
+                """
+            )
+            logging.info("Computed compact OD path-cost table.")
+
+            conn.execute(
+                f"""
+                CREATE OR REPLACE TEMP TABLE od_adjustment AS
+                SELECT
+                    t.origin,
+                    t.destination,
+                    t.od_id,
+                    MIN(LEAST(total.acc_capacity / NULLIF(total.total_flow, 0), 1.0)) AS adjust_r
+                FROM {temp_flow_table} t
+                CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                JOIN edge_attrs e
+                  ON e.path = u.path_idx
+                JOIN total
+                  ON total.e_id = e.e_id
+                GROUP BY t.od_id, t.origin, t.destination;
+                """
+            )
+            logging.info("Computed compact OD capacity-adjustment table.")
+
+            conn.execute(
+                """
+        CREATE OR REPLACE TEMP TABLE temp_flow_matrix AS
+        SELECT
+            o.od_id,
+            o.origin,
+            o.destination,
+                    o.e_id,
+                    o.flow * COALESCE(a.adjust_r, 1.0) AS flow,
+                    o.fuel,
+                    o.time,
+                    o.toll,
+                    o.length_mile
+                FROM od_results_iter o
+                LEFT JOIN od_adjustment a USING (od_id, origin, destination);
+                """
+            )
+            logging.info("Complete creating temp_flow_matrix table in Duckdb!")
+            conn.execute(f"DROP TABLE IF EXISTS {temp_flow_table}")
+            return
+
+        if path_strategy in {"duckdb_chunked_compact", "option2"}:
+            logging.info(
+                "Aggregating path costs and edge totals in chunked DuckDB compact mode..."
+            )
+            conn.execute(
+                f"""
+                CREATE OR REPLACE TEMP TABLE temp_flow_indexed AS
+                SELECT
+                    ROW_NUMBER() OVER () AS rn,
+                    origin,
+                    destination,
+                    path,
+                    flow
+                FROM {temp_flow_table};
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE edge_total_parts (
+                    e_id VARCHAR,
+                    acc_capacity DOUBLE,
+                    total_flow DOUBLE
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE od_results_iter (
+                    od_id BIGINT,
+                    origin VARCHAR,
+                    destination VARCHAR,
+                    e_id VARCHAR[],
+                    flow DOUBLE,
+                    fuel DOUBLE,
+                    time DOUBLE,
+                    toll DOUBLE,
+                    length_mile DOUBLE
+                );
+                """
+            )
+            for start in tqdm(
+                range(1, total_rows + 1, chunk_size),
+                desc="DuckDB compact pass 1:",
+                unit="chunk",
+            ):
+                end = min(start + chunk_size - 1, total_rows)
+                conn.execute(
+                    f"""
+                    INSERT INTO edge_total_parts
+                    SELECT
+                        e.e_id,
+                        MAX(r.acc_capacity) AS acc_capacity,
+                        SUM(t.flow) AS total_flow
+                    FROM temp_flow_indexed t
+                    CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                    JOIN edge_attrs e
+                      ON e.path = u.path_idx
+                    LEFT JOIN road_caps r
+                      ON r.e_id = e.e_id
+                    WHERE t.rn BETWEEN {start} AND {end}
+                    GROUP BY e.e_id;
+                    """
+                )
+                conn.execute(
+                    f"""
+                    INSERT INTO od_results_iter
+                    SELECT
+                        t.origin,
+                        t.destination,
+                        LIST(e.e_id ORDER BY u.ord) AS e_id,
+                        FIRST(t.flow) AS flow,
+                        SUM(e.fuel) AS fuel,
+                        SUM(e.time) AS time,
+                        SUM(e.toll) AS toll,
+                        SUM(e.length_mile) AS length_mile
+                    FROM temp_flow_indexed t
+                    CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                    JOIN edge_attrs e
+                      ON e.path = u.path_idx
+                    WHERE t.rn BETWEEN {start} AND {end}
+                    GROUP BY t.origin, t.destination;
+                    """
+                )
+
+            conn.execute(
+                """
+                CREATE TABLE total AS
+                SELECT
+                    e_id,
+                    MAX(acc_capacity) AS acc_capacity,
+                    SUM(total_flow) AS total_flow
+                FROM edge_total_parts
+                GROUP BY e_id;
+                """
+            )
+            logging.info("DuckDB compact pass 1 complete.")
+
+            conn.execute(
+                """
+                CREATE TABLE od_adjustment_parts (
+                    origin VARCHAR,
+                    destination VARCHAR,
+                    adjust_r DOUBLE
+                );
+                """
+            )
+            for start in tqdm(
+                range(1, total_rows + 1, chunk_size),
+                desc="DuckDB compact pass 2:",
+                unit="chunk",
+            ):
+                end = min(start + chunk_size - 1, total_rows)
+                conn.execute(
+                    f"""
+                    INSERT INTO od_adjustment_parts
+                    SELECT
+                        t.origin,
+                        t.destination,
+                        MIN(LEAST(total.acc_capacity / NULLIF(total.total_flow, 0), 1.0)) AS adjust_r
+                    FROM temp_flow_indexed t
+                    CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                    JOIN edge_attrs e
+                      ON e.path = u.path_idx
+                    JOIN total
+                      ON total.e_id = e.e_id
+                    WHERE t.rn BETWEEN {start} AND {end}
+                    GROUP BY t.origin, t.destination;
+                    """
+                )
+
+            conn.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE od_adjustment AS
+                SELECT origin, destination, MIN(adjust_r) AS adjust_r
+                FROM od_adjustment_parts
+                GROUP BY origin, destination;
+                """
+            )
+            conn.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE temp_flow_matrix AS
+                SELECT
+                    o.origin,
+                    o.destination,
+                    o.e_id,
+                    o.flow * COALESCE(a.adjust_r, 1.0) AS flow,
+                    o.fuel,
+                    o.time,
+                    o.toll,
+                    o.length_mile
+                FROM od_results_iter o
+                LEFT JOIN od_adjustment a USING (origin, destination);
+                """
+            )
+            logging.info("Complete creating temp_flow_matrix table in Duckdb!")
+            conn.execute(f"DROP TABLE IF EXISTS {temp_flow_table}")
+            return
+
+        if path_strategy in {"pandas_chunked", "option3"}:
+            logging.info("Aggregating path costs and edge totals in pandas chunks...")
+            pandas_chunk_size = min(
+                chunk_size,
+                int(os.environ.get("NIRD_PANDAS_PATH_CHUNK_SIZE", "50000")),
+            )
+            road_caps_df = road_links[["e_id", "acc_capacity"]].copy()
+            first_od = True
+            first_edge = True
+            for start in tqdm(
+                range(0, total_rows, pandas_chunk_size),
+                desc="Pandas compact pass 1:",
+                unit="chunk",
+            ):
+                chunk = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM {temp_flow_table}
+                    LIMIT {pandas_chunk_size}
+                    OFFSET {start}
+                    """
+                ).fetchdf()
+                if chunk.empty:
+                    continue
+                chunk = chunk.explode("path")
+                chunk = chunk.join(edges_df, on="path")
+                chunk = chunk.merge(road_caps_df, on="e_id", how="left")
+                od_df = chunk.groupby(["origin", "destination"], as_index=False).agg(
+                    {
+                        "e_id": list,
+                        "flow": "first",
+                        "fuel": "sum",
+                        "time": "sum",
+                        "toll": "sum",
+                        "length_mile": "sum",
+                    }
+                )
+                edge_df = chunk.groupby("e_id", as_index=False).agg(
+                    {"acc_capacity": "max", "flow": "sum"}
+                )
+                edge_df.rename(columns={"flow": "total_flow"}, inplace=True)
+                conn.register("od_df_tmp", od_df)
+                conn.register("edge_df_tmp", edge_df)
+                if first_od:
+                    conn.execute("CREATE TABLE od_results_iter AS SELECT * FROM od_df_tmp")
+                    first_od = False
+                else:
+                    conn.execute("INSERT INTO od_results_iter SELECT * FROM od_df_tmp")
+                if first_edge:
+                    conn.execute("CREATE TABLE edge_total_parts AS SELECT * FROM edge_df_tmp")
+                    first_edge = False
+                else:
+                    conn.execute("INSERT INTO edge_total_parts SELECT * FROM edge_df_tmp")
+                conn.unregister("od_df_tmp")
+                conn.unregister("edge_df_tmp")
+                del chunk, od_df, edge_df
+                gc.collect()
+
+            conn.execute(
+                """
+                CREATE TABLE total AS
+                SELECT
+                    e_id,
+                    MAX(acc_capacity) AS acc_capacity,
+                    SUM(total_flow) AS total_flow
+                FROM edge_total_parts
+                GROUP BY e_id;
+                """
+            )
+            total_df = conn.execute("SELECT * FROM total").fetchdf()
+            total_df["ratio"] = (
+                total_df["acc_capacity"] / total_df["total_flow"].replace(0, pd.NA)
+            ).clip(upper=1.0).fillna(1.0)
+            ratios = total_df[["e_id", "ratio"]]
+            first_adj = True
+            for start in tqdm(
+                range(0, total_rows, pandas_chunk_size),
+                desc="Pandas compact pass 2:",
+                unit="chunk",
+            ):
+                chunk = conn.execute(
+                    f"""
+                    SELECT origin, destination, path
+                    FROM {temp_flow_table}
+                    LIMIT {pandas_chunk_size}
+                    OFFSET {start}
+                    """
+                ).fetchdf()
+                if chunk.empty:
+                    continue
+                chunk = chunk.explode("path")
+                chunk = chunk.join(edges_df[["e_id"]], on="path")
+                chunk = chunk.merge(ratios, on="e_id", how="left")
+                adj_df = (
+                    chunk.groupby(["origin", "destination"], as_index=False)["ratio"]
+                    .min()
+                    .rename(columns={"ratio": "adjust_r"})
+                )
+                conn.register("adj_df_tmp", adj_df)
+                if first_adj:
+                    conn.execute(
+                        "CREATE TABLE od_adjustment_parts AS SELECT * FROM adj_df_tmp"
+                    )
+                    first_adj = False
+                else:
+                    conn.execute("INSERT INTO od_adjustment_parts SELECT * FROM adj_df_tmp")
+                conn.unregister("adj_df_tmp")
+                del chunk, adj_df
+                gc.collect()
+
+            conn.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE od_adjustment AS
+                SELECT origin, destination, MIN(adjust_r) AS adjust_r
+                FROM od_adjustment_parts
+                GROUP BY origin, destination;
+                """
+            )
+            conn.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE temp_flow_matrix AS
+                SELECT
+                    o.origin,
+                    o.destination,
+                    o.e_id,
+                    o.flow * COALESCE(a.adjust_r, 1.0) AS flow,
+                    o.fuel,
+                    o.time,
+                    o.toll,
+                    o.length_mile
+                FROM od_results_iter o
+                LEFT JOIN od_adjustment a USING (origin, destination);
+                """
+            )
+            logging.info("Complete creating temp_flow_matrix table in Duckdb!")
+            conn.execute(f"DROP TABLE IF EXISTS {temp_flow_table}")
+            return
+
+        chunked_duckdb = os.environ.get(
+            "NIRD_DUCKDB_CHUNKED_PATH_EXPANSION", "0"
+        ).strip().lower() in {"1", "true", "yes"}
+        if chunked_duckdb:
+            first_chunk = True
+            for start in tqdm(
+                range(0, total_rows, chunk_size),
+                desc="Expanding OD paths in DuckDB chunks:",
+                unit="chunk",
+            ):
+                conn.execute(
+                    f"""
+                    CREATE OR REPLACE TEMP TABLE path_chunk AS
+                    SELECT *
+                    FROM {temp_flow_table}
+                    LIMIT {chunk_size}
+                    OFFSET {start};
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE OR REPLACE TEMP TABLE exploded_paths_chunk AS
+                    SELECT
+                        t.origin,
+                        t.destination,
+                        t.flow,
+                        u.ord,
+                        e.e_id,
+                        e.time,
+                        e.fuel,
+                        e.toll,
+                        e.length_mile,
+                        r.acc_capacity
+                    FROM path_chunk t
+                    CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                    JOIN edge_attrs e
+                      ON e.path = u.path_idx
+                    LEFT JOIN road_caps r
+                      ON r.e_id = e.e_id;
+                    """
+                )
+                if first_chunk:
+                    conn.execute(
+                        """
+                        CREATE TABLE od_results_iter AS
+                        SELECT
+                            origin,
+                            destination,
+                            LIST(e_id ORDER BY ord) AS e_id,
+                            FIRST(flow) AS flow,
+                            SUM(fuel) AS fuel,
+                            SUM(time) AS time,
+                            SUM(toll) AS toll,
+                            SUM(length_mile) AS length_mile
+                        FROM exploded_paths_chunk
+                        GROUP BY origin, destination;
+                        """
+                    )
+                    conn.execute(
+                        """
+                        CREATE TABLE edge_flows AS
+                        SELECT
+                            e_id,
+                            origin,
+                            destination,
+                            MAX(acc_capacity) AS acc_capacity,
+                            SUM(flow) AS flow
+                        FROM exploded_paths_chunk
+                        GROUP BY e_id, origin, destination;
+                        """
+                    )
+                    first_chunk = False
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO od_results_iter
+                        SELECT
+                            origin,
+                            destination,
+                            LIST(e_id ORDER BY ord) AS e_id,
+                            FIRST(flow) AS flow,
+                            SUM(fuel) AS fuel,
+                            SUM(time) AS time,
+                            SUM(toll) AS toll,
+                            SUM(length_mile) AS length_mile
+                        FROM exploded_paths_chunk
+                        GROUP BY origin, destination;
+                        """
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO edge_flows
+                        SELECT
+                            e_id,
+                            origin,
+                            destination,
+                            MAX(acc_capacity) AS acc_capacity,
+                            SUM(flow) AS flow
+                        FROM exploded_paths_chunk
+                        GROUP BY e_id, origin, destination;
+                        """
+                    )
+                conn.execute("DROP TABLE IF EXISTS exploded_paths_chunk")
+                conn.execute("DROP TABLE IF EXISTS path_chunk")
+            logging.info("Chunked DuckDB path expansion complete. Aggregating final results...")
+
+            conn.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE total AS
+                SELECT e_id, SUM(flow) AS total_flow
+                FROM edge_flows
+                GROUP BY e_id;
+                """
+            )
+            conn.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE od_adjustment AS
+                SELECT
+                    e.origin,
+                    e.destination,
+                    MIN(LEAST(e.acc_capacity / NULLIF(t.total_flow, 0), 1.0)) AS adjust_r
+                FROM edge_flows e
+                JOIN total t USING (e_id)
+                GROUP BY e.origin, e.destination;
+                """
+            )
+            conn.execute(
+                """
+                CREATE OR REPLACE TEMP TABLE temp_flow_matrix AS
+                SELECT
+                    o.origin,
+                    o.destination,
+                    o.e_id,
+                    o.flow * COALESCE(a.adjust_r, 1.0) AS flow,
+                    o.fuel,
+                    o.time,
+                    o.toll,
+                    o.length_mile
+                FROM od_results_iter o
+                LEFT JOIN od_adjustment a USING (origin, destination);
+                """
+            )
+            logging.info("Complete creating temp_flow_matrix table in Duckdb!")
+            conn.execute(f"DROP TABLE IF EXISTS {temp_flow_table}")
+            return
 
         conn.execute("DROP TABLE IF EXISTS exploded_paths")
         conn.execute(
@@ -1160,15 +2459,103 @@ def network_flow_model(
     initial_sumod = remain_od["Car21"].sum()
     assigned_sumod = 0
     iter_flag = 1
+    next_od_id_base = 0
     max_iterations = int(os.environ.get("NIRD_MAX_FLOW_ITERATIONS", "0"))
     min_progress_rel = float(os.environ.get("NIRD_MIN_FLOW_PROGRESS_REL", "1e-6"))
     stagnant_limit = int(os.environ.get("NIRD_STAGNANT_ITERATIONS", "3"))
     stagnant_iterations = 0
+    path_strategy = os.environ.get(
+        "NIRD_PATH_REALIZATION_STRATEGY", "legacy_compact_sql"
+    ).strip().lower()
+    direct_output_mode = odpfc_out_path is not None
+    odpfc_mode_env = os.environ.get("NIRD_ODPFC_OUTPUT_MODE")
+    if odpfc_mode_env is not None:
+        odpfc_output_mode = odpfc_mode_env.strip().lower()
+    elif direct_output_mode and path_strategy in {"streaming_arrays", "streaming"}:
+        odpfc_output_mode = "iteration_parquet"
+    else:
+        odpfc_output_mode = "duckdb_table"
+    if odpfc_output_mode not in {"duckdb_table", "iteration_parquet", "skip"}:
+        raise ValueError(
+            "NIRD_ODPFC_OUTPUT_MODE must be one of duckdb_table, "
+            "iteration_parquet, or skip"
+        )
+    combine_env = os.environ.get("NIRD_COMBINE_ODPFC_PARTS")
+    if combine_env is None:
+        combine_odpfc_parts = not (
+            direct_output_mode
+            and path_strategy in {"streaming_arrays", "streaming"}
+            and odpfc_output_mode == "iteration_parquet"
+        )
+    else:
+        combine_odpfc_parts = combine_env.strip().lower() in {"1", "true", "yes"}
+    odpfc_parts_dir = None
+    if odpfc_out_path is not None and odpfc_output_mode == "iteration_parquet":
+        odpfc_parts_dir = os.path.join(os.path.dirname(odpfc_out_path), "odpfc_parts")
+        os.makedirs(odpfc_parts_dir, exist_ok=True)
+    baseline_mode_env = os.environ.get("NIRD_BASELINE_PATH_OUTPUT_MODE")
+    if baseline_mode_env is not None:
+        baseline_path_output_mode = baseline_mode_env.strip().lower()
+    elif direct_output_mode and path_strategy in {"streaming_arrays", "streaming"}:
+        baseline_path_output_mode = "path_index"
+    else:
+        baseline_path_output_mode = "full_odpfc"
+    if baseline_path_output_mode not in {
+        "none",
+        "od_meta_only",
+        "path_index",
+        "event_candidates",
+        "full_odpfc",
+    }:
+        raise ValueError(
+            "NIRD_BASELINE_PATH_OUTPUT_MODE must be one of none, "
+            "od_meta_only, path_index, event_candidates, or full_odpfc"
+        )
+    write_full_odpfc = baseline_path_output_mode == "full_odpfc"
+    baseline_out_dir = os.path.dirname(odpfc_out_path) if odpfc_out_path is not None else None
+    od_meta_parts_dir = None
+    path_index_parts_dir = None
+    edge_lookup_path = None
+    event_candidates_root = None
+    combine_event_candidate_parts = os.environ.get(
+        "NIRD_COMBINE_EVENT_CANDIDATE_PARTS", "0"
+    ).strip().lower() in {"1", "true", "yes"}
+    damaged_edges_path = os.environ.get("NIRD_EVENT_DAMAGED_EDGES_PATH")
+    if baseline_out_dir and baseline_path_output_mode in {"od_meta_only", "path_index"}:
+        od_meta_parts_dir = os.path.join(baseline_out_dir, "baseline_od_meta_parts")
+        os.makedirs(od_meta_parts_dir, exist_ok=True)
+    if baseline_out_dir and baseline_path_output_mode == "path_index":
+        path_index_parts_dir = os.path.join(baseline_out_dir, "baseline_path_index_parts")
+        os.makedirs(path_index_parts_dir, exist_ok=True)
+        edge_lookup_path = os.path.join(baseline_out_dir, "edge_lookup.pq")
+    if baseline_out_dir and baseline_path_output_mode == "event_candidates":
+        event_candidates_root = os.path.join(baseline_out_dir, "event_disrupted_candidates")
+        os.makedirs(event_candidates_root, exist_ok=True)
+    create_full_temp_env = os.environ.get("NIRD_CREATE_FULL_TEMP_FLOW_MATRIX")
+    if create_full_temp_env is None:
+        create_full_temp_flow_matrix = baseline_path_output_mode != "event_candidates"
+    else:
+        create_full_temp_flow_matrix = create_full_temp_env.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
     logging.info(
         "Iteration controls: "
         f"max_iterations={'unbounded' if max_iterations <= 0 else max_iterations}, "
         f"min_progress_rel={min_progress_rel}, "
         f"stagnant_limit={stagnant_limit}"
+    )
+    logging.info(
+        "OD path output controls: "
+        f"path_strategy={path_strategy}, "
+        f"odpfc_output_mode={odpfc_output_mode}, "
+        f"combine_odpfc_parts={combine_odpfc_parts}, "
+        f"odpfc_parts_dir={odpfc_parts_dir}, "
+        f"baseline_path_output_mode={baseline_path_output_mode}, "
+        f"combine_event_candidate_parts={combine_event_candidate_parts}, "
+        f"damaged_edges_path={damaged_edges_path}, "
+        f"create_full_temp_flow_matrix={create_full_temp_flow_matrix}"
     )
 
     # create db (remove the pre-exist one)
@@ -1176,6 +2563,26 @@ def network_flow_model(
         os.remove(db_path)
     # create isolated_od table
     conn = duckdb.connect(db_path)
+    if edge_lookup_path is not None:
+        edge_lookup_df = pd.DataFrame(
+            {"edge_idx": np.arange(number_of_edges, dtype=np.int32), "e_id": network.es["e_id"]}
+        )
+        conn.register("edge_lookup_df", edge_lookup_df)
+        conn.execute(
+            f"""
+            COPY (
+                SELECT edge_idx, e_id
+                FROM edge_lookup_df
+            ) TO '{_sql_path(edge_lookup_path)}' (FORMAT PARQUET);
+            """
+        )
+        conn.unregister("edge_lookup_df")
+        logging.info(
+            "Wrote edge_lookup.pq with %s rows to %s",
+            len(edge_lookup_df),
+            edge_lookup_path,
+        )
+        del edge_lookup_df
     conn.execute(
         """
         CREATE OR REPLACE TABLE isolated_od (
@@ -1189,9 +2596,10 @@ def network_flow_model(
     conn.execute(
         """
         CREATE OR REPLACE TABLE odpfc (
+            od_id BIGINT,
             origin VARCHAR,
             destination VARCHAR,
-            path VARCHAR,
+            path VARCHAR[],
             flow DOUBLE,
             fuel DOUBLE,
             time DOUBLE,
@@ -1433,6 +2841,29 @@ def network_flow_model(
             logging.info("Stop: no remaining flows!")
             conn.execute("DROP TABLE IF EXISTS temp_flow_matrix_input")
             break
+        logging.info(
+            "Assigning stable od_id values %s to %s for %s path rows.",
+            next_od_id_base,
+            next_od_id_base + temp_flow_count - 1,
+            temp_flow_count,
+        )
+        conn.execute(
+            f"""
+            CREATE OR REPLACE TABLE temp_flow_matrix_input_indexed AS
+            SELECT
+                CAST({next_od_id_base} + ROW_NUMBER() OVER (
+                    ORDER BY origin, destination
+                ) - 1 AS BIGINT) AS od_id,
+                origin,
+                destination,
+                path,
+                flow
+            FROM temp_flow_matrix_input;
+            """
+        )
+        conn.execute("DROP TABLE temp_flow_matrix_input")
+        conn.execute("ALTER TABLE temp_flow_matrix_input_indexed RENAME TO temp_flow_matrix_input")
+        next_od_id_base += temp_flow_count
 
         # %%
         logging.info("Create temp_flow_matrix table in duckdb...")
@@ -1445,13 +2876,31 @@ def network_flow_model(
             db_path=db_path,
             conn=conn,
             temp_flow_table="temp_flow_matrix_input",
+            create_full_temp_flow_matrix=create_full_temp_flow_matrix,
+            event_candidates_out_dir=baseline_out_dir,
+            damaged_edges_path=damaged_edges_path,
+            combine_event_candidate_parts=combine_event_candidate_parts,
+            vehicle_type=vehicle_type,
         )  # -> xxx, fuel, time, toll
 
-        assigned_iter_sum = (
-            conn.execute(
-                "SELECT COALESCE(SUM(flow), 0.0) FROM temp_flow_matrix"
-            ).fetchone()[0]
-            or 0.0
+        if create_full_temp_flow_matrix:
+            assigned_iter_sum = (
+                conn.execute(
+                    "SELECT COALESCE(SUM(flow), 0.0) FROM temp_flow_matrix"
+                ).fetchone()[0]
+                or 0.0
+            )
+        else:
+            assigned_iter_sum = (
+                conn.execute(
+                    "SELECT COALESCE(assigned_flow_total, 0.0) FROM temp_iteration_costs"
+                ).fetchone()[0]
+                or 0.0
+            )
+        logging.info(
+            "Post-realization assigned_iter_sum for iteration %s: %s",
+            iter_flag,
+            assigned_iter_sum,
         )
 
         # assign flows (scalar) for this iteration
@@ -1495,80 +2944,304 @@ def network_flow_model(
             time_expr = "time"
             fare_expr = "0.0"
 
-        conn.execute(
-            f"""
-            INSERT INTO odpfc (
-                origin,
-                destination,
-                path,
-                flow,
-                fuel,
-                time,
-                toll,
-                fare
-            )
-            SELECT
-                origin,
-                destination,
-                e_id AS path,
-                flow,
-                fuel,
-                {time_expr} AS time,
-                toll,
-                {fare_expr} AS fare
-            FROM temp_flow_matrix
-            """
+        logging.info(
+            "Writing OD path output for iteration %s with mode=%s...",
+            iter_flag,
+            baseline_path_output_mode,
         )
+        if write_full_odpfc:
+            if odpfc_output_mode == "duckdb_table":
+                conn.execute(
+                    f"""
+                    INSERT INTO odpfc (
+                        od_id,
+                        origin,
+                        destination,
+                        path,
+                        flow,
+                        fuel,
+                        time,
+                        toll,
+                        fare
+                    )
+                    SELECT
+                        od_id,
+                        origin,
+                        destination,
+                        e_id AS path,
+                        flow,
+                        fuel,
+                        {time_expr} AS time,
+                        toll,
+                        {fare_expr} AS fare
+                    FROM temp_flow_matrix
+                    """
+                )
+                logging.info("Finished INSERT INTO odpfc for iteration %s.", iter_flag)
+            elif odpfc_output_mode == "iteration_parquet":
+                if odpfc_parts_dir is None:
+                    raise ValueError(
+                        "iteration_parquet mode requires odpfc_out_path so an "
+                        "odpfc_parts directory can be derived"
+                    )
+                part_path = os.path.join(odpfc_parts_dir, f"odpfc_iter_{iter_flag:06d}.pq")
+                conn.execute(
+                    f"""
+                    COPY (
+                        SELECT
+                            od_id,
+                            origin AS origin_node,
+                            destination AS destination_node,
+                            e_id AS path,
+                            flow,
+                            fuel AS operating_cost_per_flow,
+                            {time_expr} AS time_cost_per_flow,
+                            toll AS toll_cost_per_flow,
+                            {fare_expr} AS fare_cost_per_flow
+                        FROM temp_flow_matrix
+                    ) TO '{_sql_path(part_path)}' (FORMAT PARQUET);
+                    """
+                )
+                logging.info("Wrote OD path output part: %s", part_path)
+            else:
+                logging.info(
+                    "Skipping full OD path output for iteration %s; profiling mode only.",
+                    iter_flag,
+                )
+        elif baseline_path_output_mode in {"od_meta_only", "path_index"}:
+            if od_meta_parts_dir is None:
+                raise ValueError(
+                    "OD metadata output requires odpfc_out_path so an output "
+                    "directory can be derived"
+                )
+            meta_part_path = os.path.join(
+                od_meta_parts_dir, f"baseline_od_meta_iter_{iter_flag:06d}.pq"
+            )
+            conn.execute(
+                f"""
+                COPY (
+                    SELECT
+                        od_id,
+                        origin AS origin_node,
+                        destination AS destination_node,
+                        flow,
+                        fuel AS operating_cost_per_flow,
+                        {time_expr} AS time_cost_per_flow,
+                        toll AS toll_cost_per_flow,
+                        {fare_expr} AS fare_cost_per_flow,
+                        length_mile
+                    FROM temp_flow_matrix
+                ) TO '{_sql_path(meta_part_path)}' (FORMAT PARQUET);
+                """
+            )
+            meta_rows = (
+                conn.execute("SELECT COUNT(*) FROM temp_flow_matrix").fetchone()[0] or 0
+            )
+            logging.info(
+                "Wrote baseline OD metadata part %s with %s rows.",
+                meta_part_path,
+                meta_rows,
+            )
+            if baseline_path_output_mode == "path_index":
+                if path_index_parts_dir is None:
+                    raise ValueError("path_index mode requires path_index_parts_dir")
+                logging.info(
+                    "Writing narrow path-index parts for iteration %s...",
+                    iter_flag,
+                )
+                min_max = conn.execute(
+                    "SELECT MIN(od_id), MAX(od_id) FROM temp_flow_matrix_input"
+                ).fetchone()
+                min_od_id, max_od_id = min_max
+                part_count = 0
+                path_index_rows = 0
+                if min_od_id is not None:
+                    path_index_chunk_size = max(
+                        1,
+                        math.ceil(
+                            (int(max_od_id) - int(min_od_id) + 1)
+                            / max(1, int(num_of_chunk))
+                        ),
+                    )
+                    for start_od in tqdm(
+                        range(int(min_od_id), int(max_od_id) + 1, path_index_chunk_size),
+                        desc="Writing path-index parts:",
+                        unit="part",
+                    ):
+                        end_od = min(start_od + path_index_chunk_size - 1, int(max_od_id))
+                        index_part_path = os.path.join(
+                            path_index_parts_dir,
+                            f"path_index_iter_{iter_flag:06d}_{part_count:04d}.pq",
+                        )
+                        conn.execute(
+                            f"""
+                            COPY (
+                                SELECT
+                                    od_id,
+                                    CAST(u.path_idx AS INTEGER) AS edge_idx,
+                                    CAST(u.ord - 1 AS INTEGER) AS path_pos
+                                FROM (
+                                    SELECT od_id, path
+                                    FROM temp_flow_matrix_input
+                                    WHERE od_id BETWEEN {start_od} AND {end_od}
+                                ) t
+                                CROSS JOIN UNNEST(t.path) WITH ORDINALITY AS u(path_idx, ord)
+                            ) TO '{_sql_path(index_part_path)}' (FORMAT PARQUET);
+                            """
+                        )
+                        part_rows = (
+                            conn.execute(
+                                f"""
+                                SELECT COALESCE(SUM(LEN(path)), 0)
+                                FROM temp_flow_matrix_input
+                                WHERE od_id BETWEEN {start_od} AND {end_od}
+                                """
+                            ).fetchone()[0]
+                            or 0
+                        )
+                        path_index_rows += int(part_rows)
+                        part_count += 1
+                logging.info(
+                    "Wrote %s path-index parts with %s rows to %s.",
+                    part_count,
+                    path_index_rows,
+                    path_index_parts_dir,
+                )
+        elif baseline_path_output_mode == "event_candidates":
+            if create_full_temp_flow_matrix:
+                if baseline_out_dir is None:
+                    raise ValueError(
+                        "event_candidates mode requires odpfc_out_path so an output "
+                        "directory can be derived"
+                    )
+                if not damaged_edges_path:
+                    raise ValueError(
+                        "event_candidates mode requires NIRD_EVENT_DAMAGED_EDGES_PATH"
+                    )
+                logging.info(
+                    "Patch 4 post-streaming event-candidate scan is active because "
+                    "NIRD_CREATE_FULL_TEMP_FLOW_MATRIX=1."
+                )
+                write_event_disrupted_candidates(
+                    conn=conn,
+                    network=network,
+                    damaged_edges_path=damaged_edges_path,
+                    out_dir=baseline_out_dir,
+                    time_expr=time_expr,
+                    fare_expr=fare_expr,
+                    chunk_size=max(1, math.ceil(temp_flow_count / max(1, int(num_of_chunk)))),
+                    iter_flag=iter_flag,
+                    combine_parts=combine_event_candidate_parts,
+                )
+            else:
+                logging.info(
+                    "Event candidates were written inside streaming pass 2; "
+                    "post-streaming event-candidate scan was not triggered."
+                )
+        elif baseline_path_output_mode == "none":
+            logging.info("Skipping baseline OD path artifacts for iteration %s.", iter_flag)
+        else:
+            raise ValueError(f"Unhandled baseline output mode: {baseline_path_output_mode}")
 
         # compute costs
-        iter_cost_fuel = (
-            conn.execute(
-                "SELECT COALESCE(SUM(flow * fuel), 0.0) FROM temp_flow_matrix"
-            ).fetchone()[0]
-            or 0.0
-        )
-        iter_cost_time = (
-            conn.execute(
-                f"SELECT COALESCE(SUM(flow * {time_expr}), 0.0) FROM temp_flow_matrix"
-            ).fetchone()[0]
-            or 0.0
-        )
-        iter_cost_toll = (
-            conn.execute(
-                "SELECT COALESCE(SUM(flow * toll), 0.0) FROM temp_flow_matrix"
-            ).fetchone()[0]
-            or 0.0
-        )
-        iter_cost_fare = (
-            conn.execute(
-                f"SELECT COALESCE(SUM(flow * {fare_expr}), 0.0) FROM temp_flow_matrix"
-            ).fetchone()[0]
-            or 0.0
-        )
+        logging.info("Computing cost components for iteration %s...", iter_flag)
+        if create_full_temp_flow_matrix:
+            iter_cost_fuel = (
+                conn.execute(
+                    "SELECT COALESCE(SUM(flow * fuel), 0.0) FROM temp_flow_matrix"
+                ).fetchone()[0]
+                or 0.0
+            )
+            iter_cost_time = (
+                conn.execute(
+                    f"SELECT COALESCE(SUM(flow * {time_expr}), 0.0) FROM temp_flow_matrix"
+                ).fetchone()[0]
+                or 0.0
+            )
+            iter_cost_toll = (
+                conn.execute(
+                    "SELECT COALESCE(SUM(flow * toll), 0.0) FROM temp_flow_matrix"
+                ).fetchone()[0]
+                or 0.0
+            )
+            iter_cost_fare = (
+                conn.execute(
+                    f"SELECT COALESCE(SUM(flow * {fare_expr}), 0.0) FROM temp_flow_matrix"
+                ).fetchone()[0]
+                or 0.0
+            )
+        else:
+            (
+                iter_cost_fuel,
+                iter_cost_time,
+                iter_cost_toll,
+                iter_cost_fare,
+            ) = conn.execute(
+                """
+                SELECT
+                    COALESCE(fuel_cost_total, 0.0),
+                    COALESCE(time_cost_total, 0.0),
+                    COALESCE(toll_cost_total, 0.0),
+                    COALESCE(fare_cost_total, 0.0)
+                FROM temp_iteration_costs
+                """
+            ).fetchone()
 
         cost_fuel += iter_cost_fuel
         cost_time += iter_cost_time
         cost_toll += iter_cost_toll
         cost_fare += iter_cost_fare
         total_cost = cost_fuel + cost_time + cost_toll + cost_fare
+        logging.info(
+            "Iteration %s cost components: fuel=%s, time=%s, toll=%s, fare=%s, total_so_far=%s",
+            iter_flag,
+            iter_cost_fuel,
+            iter_cost_time,
+            iter_cost_toll,
+            iter_cost_fare,
+            total_cost,
+        )
 
-        # aggregate edge flows from edge_flows table
-        temp_edge_flow = conn.execute(
-            """
-            SELECT
-                e AS e_id,
-                SUM(flow) AS flow
-            FROM (
+        # aggregate edge flows from realized paths
+        if path_strategy in {"streaming_arrays", "streaming"}:
+            logging.info(
+                "Loading edge flows directly from temp_edge_flow for iteration %s.",
+                iter_flag,
+            )
+            temp_edge_flow = conn.execute(
+                """
+                SELECT e_id, flow
+                FROM temp_edge_flow
+                WHERE flow > 0
+                """
+            ).fetchdf()
+            logging.info(
+                "Loaded %s temp_edge_flow rows directly; UNNEST(e_id) not triggered.",
+                len(temp_edge_flow),
+            )
+        else:
+            logging.info(
+                "Computing edge flows with UNNEST(e_id) for iteration %s.",
+                iter_flag,
+            )
+            temp_edge_flow = conn.execute(
+                """
                 SELECT
-                    flow,
-                    UNNEST(e_id) AS e
-                FROM temp_flow_matrix
-            ) AS t
-            GROUP BY e
-        """
-        ).fetchdf()
+                    e AS e_id,
+                    SUM(flow) AS flow
+                FROM (
+                    SELECT
+                        flow,
+                        UNNEST(e_id) AS e
+                    FROM temp_flow_matrix
+                ) AS t
+                GROUP BY e
+            """
+            ).fetchdf()
+            logging.info("Loaded %s edge-flow rows from UNNEST path.", len(temp_edge_flow))
 
         # merge edge flows into road_links and update accumulators
+        logging.info("Updating road_links with iteration %s edge flows...", iter_flag)
         road_links = road_links.merge(
             temp_edge_flow[["e_id", "flow"]], on="e_id", how="left"
         )
@@ -1580,26 +3253,31 @@ def network_flow_model(
         logging.info("Updating edge speeds: ")
         update_edge_speed(road_links, inplace=True)
         road_links.drop(columns=["flow"], inplace=True)
+        logging.info("Finished road_links update for iteration %s.", iter_flag)
 
         # update remain od using DuckDB
+        logging.info("Updating remain_od for iteration %s...", iter_flag)
+        assignment_table = (
+            "temp_flow_matrix" if create_full_temp_flow_matrix else "temp_od_assignment"
+        )
         conn.execute(
-            """
-        CREATE OR REPLACE TEMP TABLE remain_od_updated AS
-        SELECT
-            r.origin_node,
-            r.destination_node,
-            GREATEST((r.Car21 - COALESCE(a.flow_assigned, 0.0)), 0.0) AS Car21
-        FROM remain_od r
-        LEFT JOIN (
+            f"""
+            CREATE OR REPLACE TEMP TABLE remain_od_updated AS
             SELECT
-                origin,
-                destination,
-                SUM(flow) AS flow_assigned
-            FROM temp_flow_matrix
-            GROUP BY origin, destination
-        ) a
-        ON r.origin_node = a.origin AND r.destination_node = a.destination;
-        """
+                r.origin_node,
+                r.destination_node,
+                GREATEST((r.Car21 - COALESCE(a.flow_assigned, 0.0)), 0.0) AS Car21
+            FROM remain_od r
+            LEFT JOIN (
+                SELECT
+                    origin,
+                    destination,
+                    SUM(flow) AS flow_assigned
+                FROM {assignment_table}
+                GROUP BY origin, destination
+            ) a
+            ON r.origin_node = a.origin AND r.destination_node = a.destination;
+            """
         )
 
         conn.execute("DELETE FROM remain_od")
@@ -1630,6 +3308,24 @@ def network_flow_model(
             f"progress_rel={progress_rel:.8%}, "
             f"stagnant_iterations={stagnant_iterations}/{stagnant_limit}."
         )
+        logging.info("Cleaning transient path-realization tables for iteration %s...", iter_flag)
+        for transient_table in [
+            "od_results_iter",
+            "od_adjustment",
+            "temp_flow_matrix_input",
+            "temp_flow_matrix",
+            "temp_od_assignment",
+            "temp_iteration_costs",
+            "temp_edge_flow",
+            "temp_edge_flow_df",
+            "edge_total_parts",
+            "od_adjustment_parts",
+            "temp_flow_indexed",
+            "total",
+            "remain_od_updated",
+        ]:
+            conn.execute(f"DROP TABLE IF EXISTS {transient_table}")
+        logging.info("Finished cleanup for iteration %s.", iter_flag)
         gc.collect()
 
         # %%
@@ -1732,17 +3428,25 @@ def network_flow_model(
                     destination_node,
                     SUM(flow) AS flow
                 FROM isolated_od
+                WHERE origin_node != destination_node
+                  AND flow > 0
                 GROUP BY origin_node, destination_node
             ) TO '{iso_out_path}' (FORMAT PARQUET);
         """
         )
-    if odpfc_out_path is not None:
+    if (
+        odpfc_out_path is not None
+        and write_full_odpfc
+        and odpfc_output_mode == "duckdb_table"
+    ):
+        logging.info("Writing final odpfc output from DuckDB table to %s", odpfc_out_path)
         conn.execute(
             f"""
             COPY (
                 SELECT
                     origin AS origin_node,
                     destination AS destination_node,
+                    MIN(od_id) AS od_id,
                     path,
                     SUM(flow) AS flow,
                     MIN(fuel) AS operating_cost_per_flow,
@@ -1753,6 +3457,103 @@ def network_flow_model(
                 GROUP BY origin, destination, path
             ) TO '{odpfc_out_path}' (FORMAT PARQUET);
         """
+        )
+        logging.info("Finished final odpfc DuckDB table export.")
+    elif (
+        odpfc_out_path is not None
+        and write_full_odpfc
+        and odpfc_output_mode == "iteration_parquet"
+    ):
+        if combine_odpfc_parts:
+            logging.info(
+                "Combining odpfc_parts from %s into %s",
+                odpfc_parts_dir,
+                odpfc_out_path,
+            )
+            conn.execute(
+                f"""
+                COPY (
+                    SELECT
+                        origin_node,
+                        destination_node,
+                        path,
+                        SUM(flow) AS flow,
+                        MIN(operating_cost_per_flow) AS operating_cost_per_flow,
+                        MIN(time_cost_per_flow) AS time_cost_per_flow,
+                        MIN(toll_cost_per_flow) AS toll_cost_per_flow,
+                        MIN(fare_cost_per_flow) AS fare_cost_per_flow
+                    FROM read_parquet('{_sql_path(os.path.join(odpfc_parts_dir, "*.pq"))}')
+                    GROUP BY origin_node, destination_node, path
+                ) TO '{_sql_path(odpfc_out_path)}' (FORMAT PARQUET);
+                """
+            )
+            logging.info("Finished combined odpfc part export.")
+        else:
+            logging.info(
+                "Leaving partitioned OD path output under %s; "
+                "NIRD_COMBINE_ODPFC_PARTS=0.",
+                odpfc_parts_dir,
+            )
+    elif (
+        odpfc_out_path is not None
+        and baseline_path_output_mode in {"od_meta_only", "path_index"}
+    ):
+        baseline_od_meta_path = os.path.join(
+            os.path.dirname(odpfc_out_path), "baseline_od_meta.pq"
+        )
+        logging.info(
+            "Combining baseline OD metadata parts from %s into %s",
+            od_meta_parts_dir,
+            baseline_od_meta_path,
+        )
+        conn.execute(
+            f"""
+            COPY (
+                SELECT *
+                FROM read_parquet('{_sql_path(os.path.join(od_meta_parts_dir, "*.pq"))}')
+            ) TO '{_sql_path(baseline_od_meta_path)}' (FORMAT PARQUET);
+            """
+        )
+        od_meta_rows = (
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM read_parquet('{_sql_path(os.path.join(od_meta_parts_dir, "*.pq"))}')
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        logging.info(
+            "Wrote baseline_od_meta.pq with %s rows. Full odpfc skipped.",
+            od_meta_rows,
+        )
+        if baseline_path_output_mode == "path_index":
+            part_count = len(
+                [
+                    name
+                    for name in os.listdir(path_index_parts_dir)
+                    if name.endswith(".pq")
+                ]
+            )
+            path_index_rows = (
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM read_parquet('{_sql_path(os.path.join(path_index_parts_dir, "*.pq"))}')
+                    """
+                ).fetchone()[0]
+                or 0
+            )
+            logging.info(
+                "Path-index artifact summary: parts=%s, rows=%s, edge_lookup=%s.",
+                part_count,
+                path_index_rows,
+                edge_lookup_path,
+            )
+    elif odpfc_out_path is not None:
+        logging.info(
+            "OD path output was skipped; no odpfc output written to %s.",
+            odpfc_out_path,
         )
     conn.close()
 

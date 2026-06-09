@@ -128,4 +128,5 @@ data/
 results/
 logs/
 profiles/
+experiments/
 va_*_log.txt

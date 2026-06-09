@@ -55,6 +55,141 @@ def first_existing(paths):
     return None
 
 
+def odpfc_source_exists(path: Path) -> bool:
+    if path.is_file():
+        return True
+    if path.is_dir() and any(path.glob("*.pq")):
+        return True
+    return False
+
+
+def load_odpfc_source(path: Path) -> pd.DataFrame:
+    """Load OD path output from a single Parquet file or odpfc_parts directory."""
+    if path.is_dir():
+        pattern = (path / "*.pq").as_posix().replace("'", "''")
+        logging.info("Loading partitioned odpfc parts from %s", path)
+        return duckdb.connect().execute(
+            f"SELECT * FROM read_parquet('{pattern}')"
+        ).fetchdf()
+    logging.info("Loading single odpfc parquet from %s", path)
+    return pd.read_parquet(path)
+
+
+def safe_event_id(value) -> str:
+    text = str(value).strip() if value is not None else "event_000001"
+    if not text:
+        text = "event_000001"
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+
+
+def event_candidate_source_exists(event_dir: Path) -> bool:
+    combined = event_dir / "disrupted_candidates.pq"
+    parts = event_dir / "parts"
+    return combined.exists() or (parts.is_dir() and any(parts.glob("*.pq")))
+
+
+def load_event_disrupted_candidates(base_output_dir: Path, event_id: str) -> pd.DataFrame:
+    """Load Patch 4 prefiltered disrupted candidates for one event."""
+    event_dir = base_output_dir / "event_disrupted_candidates" / safe_event_id(event_id)
+    combined = event_dir / "disrupted_candidates.pq"
+    parts = event_dir / "parts"
+    if combined.exists():
+        logging.info("Loading event disrupted candidates from %s", combined)
+        candidates = pd.read_parquet(combined)
+    elif parts.is_dir() and any(parts.glob("*.pq")):
+        pattern = (parts / "*.pq").as_posix().replace("'", "''")
+        logging.info("Loading event disrupted candidate parts from %s", parts)
+        candidates = duckdb.connect().execute(
+            f"SELECT * FROM read_parquet('{pattern}')"
+        ).fetchdf()
+    else:
+        raise FileNotFoundError(
+            f"Missing event disrupted candidates for event_id={event_id} under {event_dir}"
+        )
+    logging.info(
+        "Script 4 event-candidate loader produced %s candidate rows for event_id=%s.",
+        len(candidates),
+        event_id,
+    )
+    return candidates
+
+
+def load_path_index_disrupted_candidates(
+    base_output_dir: Path,
+    damaged_edges: set[str],
+) -> pd.DataFrame:
+    """Load disrupted candidates from baseline path-index artifacts."""
+    meta_path = base_output_dir / "baseline_od_meta.pq"
+    index_dir = base_output_dir / "baseline_path_index_parts"
+    edge_lookup_path = base_output_dir / "edge_lookup.pq"
+    if not meta_path.exists() or not index_dir.exists() or not edge_lookup_path.exists():
+        raise FileNotFoundError(
+            "Missing path-index artifacts. Expected baseline_od_meta.pq, "
+            "baseline_path_index_parts/, and edge_lookup.pq under "
+            f"{base_output_dir}"
+        )
+    con = duckdb.connect()
+    damaged_df = pd.DataFrame({"e_id": sorted(str(e) for e in damaged_edges)})
+    con.register("damaged_edges", damaged_df)
+    index_pattern = (index_dir / "*.pq").as_posix().replace("'", "''")
+    meta_sql = meta_path.as_posix().replace("'", "''")
+    lookup_sql = edge_lookup_path.as_posix().replace("'", "''")
+    damaged_edge_count = len(damaged_df)
+    damaged_idx_count = con.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM read_parquet('{lookup_sql}') e
+        JOIN damaged_edges d USING (e_id)
+        """
+    ).fetchone()[0]
+    logging.info(
+        "Script 4 path_index loader: damaged_edges=%s, damaged_edge_idx=%s",
+        damaged_edge_count,
+        damaged_idx_count,
+    )
+    disrupted_candidates = con.execute(
+        f"""
+        WITH damaged_idx AS (
+            SELECT edge_idx, e_id
+            FROM read_parquet('{lookup_sql}') e
+            JOIN damaged_edges d USING (e_id)
+        ),
+        hits AS (
+            SELECT
+                p.od_id,
+                LIST(d.e_id ORDER BY p.path_pos) AS flood_links
+            FROM read_parquet('{index_pattern}') p
+            JOIN damaged_idx d USING (edge_idx)
+            GROUP BY p.od_id
+        ),
+        affected_paths AS (
+            SELECT
+                p.od_id,
+                LIST(e.e_id ORDER BY p.path_pos) AS path
+            FROM read_parquet('{index_pattern}') p
+            JOIN hits h USING (od_id)
+            JOIN read_parquet('{lookup_sql}') e USING (edge_idx)
+            GROUP BY p.od_id
+        )
+        SELECT
+            m.*,
+            ap.path,
+            h.flood_links
+        FROM read_parquet('{meta_sql}') m
+        JOIN hits h USING (od_id)
+        JOIN affected_paths ap USING (od_id)
+        """
+    ).fetchdf()
+    con.unregister("damaged_edges")
+    con.close()
+    logging.info(
+        "Script 4 path_index loader produced %s disrupted candidates; "
+        "full path reconstruction performed for affected ODs only.",
+        len(disrupted_candidates),
+    )
+    return disrupted_candidates
+
+
 def to_edge_id_list(value):
     """Convert path-like values from parquet into a normalized list of edge-id strings."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -285,7 +420,7 @@ def main(
         conditions,  # condition == 1: day 0, otherwise: day > 0
     ) = load_scenarios(base_path)
 
-    # Load pre-identified odpfc (containing flooded links)
+    # Locate pre-identified odpfc or base-scenario path-index artifacts.
     results_variant = get_results_variant()
     odpfc_path = (
         base_path.parent
@@ -295,34 +430,72 @@ def main(
         / "od"
         / f"odpfc_{depth_key}_{flood_key}.pq"
     )
-    if not odpfc_path.exists():
+    odpfc_parts_path = odpfc_path.parent / "odpfc_parts"
+    candidate_source_mode = "legacy_odpfc"
+    candidate_source_path = odpfc_path
+    event_id_candidates = [
+        safe_event_id(f"{depth_key}_{flood_key}"),
+        safe_event_id(flood_key),
+    ]
+    if not odpfc_path.exists() and odpfc_source_exists(odpfc_parts_path):
+        candidate_source_path = odpfc_parts_path
+    if not odpfc_source_exists(candidate_source_path):
         logging.warning(
-            f"Missing odpfc at {odpfc_path}. Falling back to base scenario odpfc."
+            f"Missing odpfc at {candidate_source_path}. Falling back to base scenario artifacts."
         )
         base_odpfc_path = (
             base_path.parent / "results" / "base_scenario" / results_variant / "odpfc.pq"
         )
-        if base_odpfc_path.exists():
-            odpfc_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.read_parquet(base_odpfc_path).to_parquet(odpfc_path)
+        base_odpfc_parts = (
+            base_path.parent
+            / "results"
+            / "base_scenario"
+            / results_variant
+            / "odpfc_parts"
+        )
+        base_path_index_dir = (
+            base_path.parent / "results" / "base_scenario" / results_variant
+        )
+        base_event_candidates_dir = base_path_index_dir
+        selected_event_id = None
+        for event_id in event_id_candidates:
+            if event_candidate_source_exists(
+                base_event_candidates_dir / "event_disrupted_candidates" / event_id
+            ):
+                selected_event_id = event_id
+                break
+        if odpfc_source_exists(base_odpfc_path):
+            candidate_source_path = base_odpfc_path
+        elif odpfc_source_exists(base_odpfc_parts):
+            candidate_source_path = base_odpfc_parts
+        elif selected_event_id is not None:
+            candidate_source_mode = "event_candidates"
+            candidate_source_path = base_event_candidates_dir
+            candidate_source_event_id = selected_event_id
+        elif (
+            (base_path_index_dir / "baseline_od_meta.pq").exists()
+            and (base_path_index_dir / "baseline_path_index_parts").exists()
+            and (base_path_index_dir / "edge_lookup.pq").exists()
+        ):
+            candidate_source_mode = "path_index"
+            candidate_source_path = base_path_index_dir
         else:
-            logging.error(f"Base scenario odpfc missing: {base_odpfc_path}")
-            sys.exit(1)
-
-    disrupted_candidates = pd.read_parquet(odpfc_path)
-    if "path" in disrupted_candidates.columns:
-        if VECTORIZE_PATH_PARSING:
-            disrupted_candidates["path"] = to_edge_id_list_vectorized(disrupted_candidates["path"])
-        else:
-            disrupted_candidates["path"] = disrupted_candidates["path"].apply(to_edge_id_list)
-    if "flood_links" in disrupted_candidates.columns:
-        if VECTORIZE_PATH_PARSING:
-            disrupted_candidates["flood_links"] = to_edge_id_list_vectorized(disrupted_candidates["flood_links"])
-        else:
-            disrupted_candidates["flood_links"] = disrupted_candidates["flood_links"].apply(
-                to_edge_id_list
+            logging.error(
+                "Base scenario path artifacts missing. Checked %s, %s, and %s",
+                base_odpfc_path,
+                base_odpfc_parts,
+                base_path_index_dir,
             )
-    disrupted_candidates["od_id"] = disrupted_candidates.index  # numbering od pairs
+            sys.exit(1)
+    if candidate_source_mode != "event_candidates":
+        candidate_source_event_id = None
+
+    logging.info(
+        "Script 4 candidate loader selected mode=%s source=%s event_id=%s",
+        candidate_source_mode,
+        candidate_source_path,
+        candidate_source_event_id,
+    )
     # Load road links with damage (e.g., flood depth and damage level)
     road_links = gpd.read_parquet(
         base_path.parent
@@ -357,15 +530,61 @@ def main(
         flow_breakpoint_dict
     )
     initial_road_links_cols = road_links.columns
+    flooded_edges = set(
+        road_links.loc[road_links["damage_level_max"] != "no", "e_id"].astype(str)
+    )
+    if candidate_source_mode == "path_index":
+        disrupted_candidates = load_path_index_disrupted_candidates(
+            Path(candidate_source_path),
+            flooded_edges,
+        )
+    elif candidate_source_mode == "event_candidates":
+        disrupted_candidates = load_event_disrupted_candidates(
+            Path(candidate_source_path),
+            candidate_source_event_id,
+        )
+        if "path" in disrupted_candidates.columns:
+            disrupted_candidates["path"] = to_edge_id_list_vectorized(
+                disrupted_candidates["path"]
+            )
+        if "flood_links" in disrupted_candidates.columns:
+            disrupted_candidates["flood_links"] = to_edge_id_list_vectorized(
+                disrupted_candidates["flood_links"]
+            )
+        if "od_id" not in disrupted_candidates.columns:
+            disrupted_candidates["od_id"] = disrupted_candidates.index
+    else:
+        disrupted_candidates = load_odpfc_source(Path(candidate_source_path))
+        if "path" in disrupted_candidates.columns:
+            if VECTORIZE_PATH_PARSING:
+                disrupted_candidates["path"] = to_edge_id_list_vectorized(
+                    disrupted_candidates["path"]
+                )
+            else:
+                disrupted_candidates["path"] = disrupted_candidates["path"].apply(
+                    to_edge_id_list
+                )
+        if "flood_links" in disrupted_candidates.columns:
+            if VECTORIZE_PATH_PARSING:
+                disrupted_candidates["flood_links"] = to_edge_id_list_vectorized(
+                    disrupted_candidates["flood_links"]
+                )
+            else:
+                disrupted_candidates["flood_links"] = disrupted_candidates[
+                    "flood_links"
+                ].apply(to_edge_id_list)
+        if "od_id" not in disrupted_candidates.columns:
+            disrupted_candidates["od_id"] = disrupted_candidates.index
+        logging.info(
+            "Script 4 legacy odpfc loader produced %s candidate rows.",
+            len(disrupted_candidates),
+        )
 
     # Build flood_links if missing (FAF pipeline uses base scenario odpfc)
     if "flood_links" not in disrupted_candidates.columns:
         if "path" not in disrupted_candidates.columns:
             logging.error("odpfc is missing 'path' column; cannot derive flood_links.")
             sys.exit(1)
-        flooded_edges = set(
-            road_links.loc[road_links["damage_level_max"] != "no", "e_id"]
-        )
         if USE_SET_BASED_FLOOD_LOOKUP:
             # Use set-based filtering (already optimized; flag available for future improvements)
             disrupted_candidates["flood_links"] = disrupted_candidates["path"].apply(

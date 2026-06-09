@@ -122,6 +122,10 @@ def main(
     if sample_stride > 1:
         logging.info(f"For testing, sampling every {sample_stride} flows")
         od_node_2021 = od_node_2021.iloc[::sample_stride]
+    sample_od_n = int(os.environ.get("NIRD_SAMPLE_OD_N", "0"))
+    if sample_od_n > 0:
+        logging.info(f"For testing, taking first {sample_od_n:,} OD rows")
+        od_node_2021 = od_node_2021.head(sample_od_n)
 
     od_flow_col = "Car21" if "Car21" in od_node_2021.columns else (
         "flow" if "flow" in od_node_2021.columns else None
@@ -173,6 +177,60 @@ def main(
     # create igraph network
     logging.info("Create igraph network")
     network, road_links = func.create_igraph_network(road_links, vehicle_type="car")
+
+    out_path = Path(
+        os.environ.get(
+            "NIRD_BASE_SCENARIO_OUT_DIR",
+            base_path.parent / "results" / "base_scenario" / get_results_variant(),
+        )
+    )
+    out_path.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NIRD_DUCKDB_CHUNKED_PATH_EXPANSION", "0")
+    os.environ.setdefault("NIRD_PATH_REALIZATION_STRATEGY", "legacy_compact_sql")
+    direct_duckdb_outputs = os.environ.get("NIRD_DIRECT_DUCKDB_OUTPUTS", "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    path_strategy = os.environ.get(
+        "NIRD_PATH_REALIZATION_STRATEGY", "legacy_compact_sql"
+    ).strip().lower()
+    if (
+        direct_duckdb_outputs
+        and path_strategy in {"streaming_arrays", "streaming"}
+        and "NIRD_BASELINE_PATH_OUTPUT_MODE" not in os.environ
+    ):
+        if os.environ.get("NIRD_EVENT_DAMAGED_EDGES_PATH"):
+            os.environ["NIRD_BASELINE_PATH_OUTPUT_MODE"] = "event_candidates"
+        else:
+            os.environ["NIRD_BASELINE_PATH_OUTPUT_MODE"] = "none"
+    if (
+        direct_duckdb_outputs
+        and path_strategy in {"streaming_arrays", "streaming"}
+        and os.environ.get("NIRD_BASELINE_PATH_OUTPUT_MODE", "").strip().lower()
+        == "full_odpfc"
+        and "NIRD_ODPFC_OUTPUT_MODE" not in os.environ
+    ):
+        os.environ["NIRD_ODPFC_OUTPUT_MODE"] = "iteration_parquet"
+    if (
+        direct_duckdb_outputs
+        and path_strategy in {"streaming_arrays", "streaming"}
+        and os.environ.get("NIRD_ODPFC_OUTPUT_MODE", "").strip().lower()
+        == "iteration_parquet"
+        and "NIRD_COMBINE_ODPFC_PARTS" not in os.environ
+    ):
+        os.environ["NIRD_COMBINE_ODPFC_PARTS"] = "0"
+    logging.info(
+        "Direct output controls: "
+        f"direct_duckdb_outputs={direct_duckdb_outputs}, "
+        f"path_strategy={path_strategy}, "
+        f"baseline_path_output_mode={os.environ.get('NIRD_BASELINE_PATH_OUTPUT_MODE', 'full_odpfc')}, "
+        f"odpfc_output_mode={os.environ.get('NIRD_ODPFC_OUTPUT_MODE', 'duckdb_table')}, "
+        f"combine_odpfc_parts={os.environ.get('NIRD_COMBINE_ODPFC_PARTS', 'default')}"
+    )
+    iso_out_path = out_path / "trip_isolations.pq"
+    odpfc_out_path = out_path / "odpfc.pq"
+
     # run flow simulation
     logging.info("Run simulation")
     (
@@ -186,7 +244,19 @@ def main(
         num_of_chunk,
         num_of_cpu,
         db_path,
+        iso_out_path=str(iso_out_path) if direct_duckdb_outputs else None,
+        odpfc_out_path=str(odpfc_out_path) if direct_duckdb_outputs else None,
     )
+
+    if direct_duckdb_outputs:
+        road_links.to_parquet(out_path / "edge_flows.gpq")
+        logging.info(
+            "Direct DuckDB output mode wrote edge_flows.gpq and "
+            "trip_isolations.pq. Baseline path artifact mode: "
+            f"{os.environ.get('NIRD_BASELINE_PATH_OUTPUT_MODE', 'full_odpfc')}."
+        )
+        logging.info(f"The total simulation time: {time.time() - start_time}")
+        return
     
     # Read isolation and odpfc from database
     conn = duckdb.connect(db_path)
@@ -235,8 +305,6 @@ def main(
     )
 
     # export files
-    out_path = base_path.parent / "results" / "base_scenario" / get_results_variant()
-    out_path.mkdir(parents=True, exist_ok=True)
     road_links.to_parquet(out_path / "edge_flows.gpq")
     isolation_df.to_parquet(out_path / "trip_isolations.pq")
     odpfc_df.to_parquet(out_path / "odpfc.pq")
@@ -259,9 +327,9 @@ if __name__ == "__main__":
         format="%(asctime)s %(process)d %(filename)s %(message)s", level=logging.INFO
     )
     try:  # in bash inputs will be str by default
-        sample_stride = 1
         num_of_chunk = sys.argv[1]
         num_of_cpu = sys.argv[2]
+        sample_stride = int(sys.argv[3]) if len(sys.argv) > 3 else 1
         main(int(num_of_chunk), int(num_of_cpu), sample_stride)
     except (IndexError, NameError):
         logging.info("Please enter num_of_chunk, num_of_cpu!")
