@@ -1,7 +1,7 @@
 {
   "paths": {
-    "soge_clusters": "D:\\NIRD_Data\\soge_clusters",
-    "base_path": "D:\\NIRD_Data\\soge_clusters",
-    "output_path": "results"
+    "soge_clusters": "C:\\Users\\akothaw\\Desktop\\data\\soge_clusters",
+    "base_path": "C:\\Users\\akothaw\\Desktop\\data\\soge_clusters",
+    "output_path": "C:\\Users\\akothaw\\Desktop\\data\\results"
   }
 }
