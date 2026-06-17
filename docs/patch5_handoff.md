@@ -2,11 +2,36 @@
 
 ## Current Branch And Baseline
 
+- GitHub repo: `https://github.com/AliMurtaza53/DAFNI-NIRD-clone.git`
 - Branch: `codex/script2-raster-prefilter-handoff`
 - Current working baseline: Patch 5 fused event-candidate writing.
 - Model logic status: no Patch 6 implementation; Patch 5 is frozen as the current operational baseline.
 - Primary status document: `docs/network_assignment_refactor_status_patch5.md`
 - Attempt log: `docs/path_realization_attempt_log.md`
+
+## New Environment Pickup
+
+Use this when resuming from a new IDE or machine:
+
+```powershell
+git clone https://github.com/AliMurtaza53/DAFNI-NIRD-clone.git
+cd DAFNI-NIRD-clone
+git checkout codex/script2-raster-prefilter-handoff
+```
+
+Then review these files first:
+
+- `docs/patch5_handoff.md`
+- `docs/network_assignment_refactor_status_patch5.md`
+- `docs/path_realization_attempt_log.md`
+- `docs/assumptions_inputs/README.md`
+
+Expected local data/config assumption in the current working copy:
+
+- `config.json` points to `C:\Users\akothaw\Desktop\data\soge_clusters`
+- Outputs are written under `C:\Users\akothaw\Desktop\data\results`
+
+If using another machine, update `config.json` to that machine's data paths before running smoke tests.
 
 ## What Patch 5 Solved
 
