@@ -345,9 +345,10 @@ def load_event_damage_from_script3(base_path: Path, flood_key: int) -> Tuple[pd.
     if damage_df.empty:
         return pd.DataFrame(columns=["e_id", "damage_level_max", "road_label"]), 0.0
 
-    # total direct damage from all mean damage columns
-    mean_cols = [c for c in damage_df.columns if c.endswith("_damage_value_mean")]
-    direct_damage_total = float(damage_df[mean_cols].fillna(0).sum().sum()) if mean_cols else 0.0
+    from nird.damage_aggregation import total_direct_damage_musd
+
+    direct_damage_total_musd = total_direct_damage_musd(damage_df)
+    direct_damage_total = direct_damage_total_musd * 1_000_000.0
 
     # aggregate event damage levels to a per-edge max
     level_map = {"no": 0, "minor": 1, "moderate": 2, "extensive": 3, "severe": 4}
@@ -464,14 +465,14 @@ def main(
             ):
                 selected_event_id = event_id
                 break
-        if odpfc_source_exists(base_odpfc_path):
-            candidate_source_path = base_odpfc_path
-        elif odpfc_source_exists(base_odpfc_parts):
-            candidate_source_path = base_odpfc_parts
-        elif selected_event_id is not None:
+        if selected_event_id is not None:
             candidate_source_mode = "event_candidates"
             candidate_source_path = base_event_candidates_dir
             candidate_source_event_id = selected_event_id
+        elif odpfc_source_exists(base_odpfc_path):
+            candidate_source_path = base_odpfc_path
+        elif odpfc_source_exists(base_odpfc_parts):
+            candidate_source_path = base_odpfc_parts
         elif (
             (base_path_index_dir / "baseline_od_meta.pq").exists()
             and (base_path_index_dir / "baseline_path_index_parts").exists()
@@ -510,6 +511,7 @@ def main(
 
     # Wire to script-3 outputs (direct damage table by event)
     damage_by_edge, direct_damage_total = load_event_damage_from_script3(base_path, flood_key)
+    direct_damage_total_musd = direct_damage_total / 1_000_000.0
     if len(damage_by_edge) > 0:
         if "damage_level_max" in road_links.columns:
             road_links = road_links.drop(columns=["damage_level_max"])
@@ -599,7 +601,10 @@ def main(
         ].reset_index(drop=True)
 
     # Recovery analysis loop
-    cDict = {}
+    # Keyed by recovery day: the recovery design table reuses scenario=1 for every
+    # event_day, so we must NOT key results by scenario_id (that collapses all days
+    # into one overwritten row, leaving only the fully-recovered final day).
+    cost_rows = []
     out_path = (
         base_path.parent
         / "results"
@@ -609,6 +614,12 @@ def main(
         / str(flood_key)
     )
     out_path.mkdir(parents=True, exist_ok=True)
+
+    # Recovery reruns only need edge flows and cost totals, not path-index artifacts.
+    os.environ["NIRD_BASELINE_PATH_OUTPUT_MODE"] = "none"
+    os.environ["NIRD_ODPFC_OUTPUT_MODE"] = "skip"
+    os.environ["NIRD_CREATE_FULL_TEMP_FLOW_MATRIX"] = "0"
+
     # Load link recovery scenarios (both capacity and speed)
     for day_idx, (scenario_id, event_day) in enumerate(zip(scenarios, conditions)):
         logging.info(f"Rerouting Analysis on Scenario-{scenario_id} of recovery...")
@@ -705,7 +716,8 @@ def main(
         disrupted_od = disrupted_od[disrupted_od["disrupted_flow"] > 0].reset_index(
             drop=True
         )
-        logging.info(f"The total disrupted flows: {disrupted_od.disrupted_flow.sum()}")
+        total_disrupted_flow = float(disrupted_od.disrupted_flow.sum())
+        logging.info(f"The total disrupted flows: {total_disrupted_flow}")
 
         # estimate the pre-event cost matrix for disrupted flows
         pre_time = (disrupted_od.disrupted_flow * disrupted_od.time_cost_per_flow).sum()
@@ -726,10 +738,30 @@ def main(
 
         """ Update road link attributes for rerouting analysis
         """
-        road_links.current_capacity = road_links.current_capacity.round(0).astype(int)
-        road_links.acc_capacity = road_links.acc_capacity.round(0).astype(int)
-        road_links.current_flow = road_links.current_flow.round(0).astype(int)
-        road_links.disrupted_flow = road_links.disrupted_flow.round(0).astype(int)
+        road_links.current_capacity = (
+            pd.to_numeric(road_links.current_capacity, errors="coerce")
+            .fillna(0)
+            .round(0)
+            .astype(int)
+        )
+        road_links.acc_capacity = (
+            pd.to_numeric(road_links.acc_capacity, errors="coerce")
+            .fillna(0)
+            .round(0)
+            .astype(int)
+        )
+        road_links.current_flow = (
+            pd.to_numeric(road_links.current_flow, errors="coerce")
+            .fillna(0)
+            .round(0)
+            .astype(int)
+        )
+        road_links.disrupted_flow = (
+            pd.to_numeric(road_links.disrupted_flow, errors="coerce")
+            .fillna(0)
+            .round(0)
+            .astype(int)
+        )
 
         road_links["acc_capacity"] = (
             road_links["acc_capacity"] + road_links["disrupted_flow"]
@@ -773,8 +805,8 @@ def main(
 
         # Run flow model
         logging.info("Running flow simulation...")
-        isolation_path = out_path / f"trip_isolations_{scenario_id}.pq"
-        odpfc_path_iter = out_path / f"odpfc_{scenario_id}.pq"
+        isolation_path = out_path / f"trip_isolations_s{scenario_id}_day{event_day}.pq"
+        odpfc_path_iter = out_path / f"odpfc_s{scenario_id}_day{event_day}.pq"
         valid_road_links, (post_time, post_operate, post_toll, total_post_cost) = func.network_flow_model(
             valid_road_links,  # update this one
             network,
@@ -807,17 +839,26 @@ def main(
 
         logging.info("Saving results to disk...")
 
-        # rerouting costs
-        cDict[scenario_id] = [rer_time, rer_operate, rer_toll, rerouting_cost]
-        cost_df = pd.DataFrame.from_dict(
-            cDict,
-            orient="index",
-            columns=["rer_time", "rer_operate", "rer_toll", "rerouting_cost"],
-        ).reset_index()
-        cost_df.rename(columns={"index": "scenario"}, inplace=True)
+        # rerouting costs (one row per recovery day; see cost_rows note above)
+        cost_rows.append(
+            {
+                "scenario": scenario_id,
+                "event_day": event_day,
+                "total_disrupted_flow": total_disrupted_flow,
+                "rer_time": rer_time,
+                "rer_operate": rer_operate,
+                "rer_toll": rer_toll,
+                "rerouting_cost": rerouting_cost,
+            }
+        )
+        cost_df = pd.DataFrame(cost_rows)
+        cost_df["direct_damage_total_musd"] = direct_damage_total_musd
+        cost_df["direct_damage_total_usd"] = direct_damage_total
         cost_df["direct_damage_total"] = direct_damage_total
         cost_df["combined_total_cost"] = cost_df["rerouting_cost"] + cost_df["direct_damage_total"]
-        cost_df.to_csv(out_path / f"rerouting_cost_{scenario_id}.csv", index=False)
+        cost_df.to_csv(
+            out_path / f"rerouting_cost_s{scenario_id}_day{event_day}.csv", index=False
+        )
 
         # trip isolations
         if isolation_path.exists():
@@ -832,7 +873,7 @@ def main(
             & (isolation_df.Car21 > 0)
         ].reset_index(drop=True)
         isolation_df.to_csv(
-            out_path / f"trip_isolations_{scenario_id}.csv",
+            out_path / f"trip_isolations_s{scenario_id}_day{event_day}.csv",
             index=False,
         )
 
@@ -864,7 +905,9 @@ def main(
         road_links.loc[updated_acc_flow.index, "acc_flow"] = updated_acc_flow.to_numpy(dtype=float)
         road_links = road_links.reset_index()
         road_links["change_flow"] = road_links["acc_flow"] - road_links["current_flow"]
-        road_links.to_parquet(out_path / f"edge_flows_{scenario_id}.gpq")
+        road_links.to_parquet(
+            out_path / f"edge_flows_s{scenario_id}_day{event_day}.gpq"
+        )
 
         # reset road_links for next scenario
         road_links = road_links[initial_road_links_cols]
@@ -875,15 +918,12 @@ def main(
         gc.collect()
 
     logging.info("Saving overall rerouting costs to disk...")
-    if len(cDict) == 0:
+    if len(cost_rows) == 0:
         logging.info("No rerouting results to save.")
         return
-    cost_df = pd.DataFrame.from_dict(
-        cDict,
-        orient="index",
-        columns=["rer_time", "rer_operate", "rer_toll", "rerouting_cost"],
-    ).reset_index()
-    cost_df.rename(columns={"index": "scenario"}, inplace=True)
+    cost_df = pd.DataFrame(cost_rows)
+    cost_df["direct_damage_total_musd"] = direct_damage_total_musd
+    cost_df["direct_damage_total_usd"] = direct_damage_total
     cost_df["direct_damage_total"] = direct_damage_total
     cost_df["combined_total_cost"] = cost_df["rerouting_cost"] + cost_df["direct_damage_total"]
     cost_df.to_csv(out_path / "cost_matrix_by_scenario.csv", index=False)
@@ -896,7 +936,8 @@ if __name__ == "__main__":
     try:
         depth_key, event_key, num_of_chunk, num_of_cpu = sys.argv[1:]
         main(int(depth_key), int(event_key), int(num_of_chunk), int(num_of_cpu))
-    except (IndexError, ValueError):
+    except (IndexError, ValueError) as exc:
+        logging.exception("Script 4 failed while parsing CLI args or during execution")
         logging.info(
             "Please provide inputs: depth_key, event_key, num_of_chunk, and num_of_cpu!"
         )
