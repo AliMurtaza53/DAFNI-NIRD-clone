@@ -4,16 +4,36 @@ CONV_METER_TO_MILE = 0.000621371
 CONV_MILE_TO_KM = 1.60934
 CONV_KM_TO_MILE = 0.621371
 PENCE_TO_POUND = 0.01
-GBP_TO_USD = 1.27  # Exchange rate conversion factor
+GBP_TO_USD = 1.27  # Exchange rate conversion factor (legacy UK cost conversion)
 
-# Value of Time in USD per hour (converted from GBP at 1.27 GBP:USD)
+# Value of Time in USD per hour (US calibration).
+# Source: USDOT "Revised Departmental Guidance on Valuation of Travel Time in
+# Economic Analysis" (2022 dollars). Local personal surface travel ~ $18.50/hr;
+# local business travel ~ $31.40/hr; truck driver ~ $32.50/hr; intercity
+# personal ~ $22.90/hr. Values were previously GBP-derived (UK NIRD) and are
+# replaced here with US figures. Dict name kept for backward compatibility;
+# see VOT_USD_PER_HOUR alias below.
 VOT_POUND_PER_HOUR = {
-    "car": 27.19,  # USD per hour (21.41 GBP * 1.27)
-    "lgv": 21.42,  # USD per hour (16.87 GBP * 1.27)
-    "ogv": 25.84,  # USD per hour (20.35 GBP * 1.27)
-    "psv": 16.70,  # USD per hour (13.15 GBP * 1.27)
-    "rail": 48.62,  # USD per hour (38.28 GBP * 1.27)
+    "car": 18.50,  # USDOT local personal surface travel
+    "lgv": 31.00,  # USDOT local business travel (light commercial van)
+    "ogv": 32.50,  # USDOT truck-driver value of travel time
+    "psv": 18.50,  # transit passenger personal travel
+    "rail": 22.90,  # USDOT intercity personal travel
 }
+# Clearer US-facing alias (same object) for new code.
+VOT_USD_PER_HOUR = VOT_POUND_PER_HOUR
+
+# US pump fuel price in USD per litre (2023-2024 national averages).
+# Gasoline ~ $3.40/gal = $0.90/L; Diesel ~ $3.95/gal = $1.04/L.
+# Replaces the legacy UK assumption of ~1.4 GBP/L * 1.27 = ~$1.78/L.
+FUEL_USD_PER_LITRE = {
+    "car": 0.90,  # gasoline
+    "lgv": 0.90,  # gasoline (light commercial)
+    "ogv": 1.04,  # diesel
+    "psv": 1.04,  # diesel
+    "rail": 1.04,  # diesel
+}
+DEFAULT_FUEL_USD_PER_LITRE = 0.95
 
 # Fuel consumption in litres per mile (converted from per km)
 # Original units: litres per km. Convert by multiplying by CONV_KM_TO_MILE

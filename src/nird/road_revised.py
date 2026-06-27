@@ -28,6 +28,13 @@ warnings.simplefilter("ignore")
 tqdm.pandas()
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes"}
+
+
 def select_partial_roads(
     road_links: gpd.GeoDataFrame,
     road_nodes: gpd.GeoDataFrame,
@@ -244,7 +251,12 @@ def compute_costs_for_links(
         # operate_cost per mile vectorised (use values from cons)
         a, b, c, d = tuple(cons.FUEL_LITRE_PER_KM[vehicle_type].values())
         L = a / np.maximum(v_kmph, eps) + b + c * v_kmph + d * v_kmph**2
-        FC = L * 1.4 * cons.GBP_TO_USD  # USD per litre
+        # US fuel price (USD/litre) instead of the legacy UK pump price
+        # (~1.4 GBP/L * 1.27). See constants.FUEL_USD_PER_LITRE.
+        fuel_price = getattr(cons, "FUEL_USD_PER_LITRE", {}).get(
+            vehicle_type, getattr(cons, "DEFAULT_FUEL_USD_PER_LITRE", 0.95)
+        )
+        FC = L * fuel_price  # USD per mile (fuel component)
 
         a1, b1 = tuple(cons.NON_FUEL_PENCE_PER_KM[vehicle_type].values())
         NFC = a1 + b1 / np.maximum(v_kmph, eps)  # cents USD per mile
@@ -403,18 +415,36 @@ def edge_initial_speed_func(
     assert "combined_label" in road_links.columns, "combined_label column not exists!"
     assert "urban" in road_links.columns, "urban column not exists!"
 
-    if (
-        "free_flow_speeds" not in road_links.columns
-    ):  # add free-flow speeds if not exist
-        road_links["free_flow_speeds"] = road_links.combined_label.map(
-            free_flow_speed_dict
-        )
+    # Per-class default free-flow speed (used as fallback for links without an
+    # observed US network speed). See parameters/free_flow_speed_dict.json.
+    class_free_flow = road_links["combined_label"].map(free_flow_speed_dict)
 
-    road_links.loc[road_links["urban"] == 1, "free_flow_speeds"] = road_links[
-        "combined_label"
-    ].map(
-        urban_flow_speed_dict
-    )  # urban speed restriction
+    if "free_flow_speeds" not in road_links.columns:
+        # US fidelity: prefer observed FAF5 link speeds (mph) when present
+        # (AB_FinalSpeed/BA_FinalSpeed are the FAF5 model final speeds; Speed_Limit
+        # is the posted speed). Fall back to the per-class default otherwise.
+        observed_speed = None
+        for col in ("AB_FinalSpeed", "BA_FinalSpeed", "Speed_Limit"):
+            if col in road_links.columns:
+                vals = pd.to_numeric(road_links[col], errors="coerce")
+                vals = vals.where(vals > 0)
+                observed_speed = (
+                    vals if observed_speed is None else observed_speed.combine_first(vals)
+                )
+        if observed_speed is not None:
+            road_links["free_flow_speeds"] = observed_speed.fillna(class_free_flow)
+        else:
+            road_links["free_flow_speeds"] = class_free_flow
+
+    # Urban speed restriction: cap free-flow at the urban limit for urban links.
+    # Use min() (rather than a hard override) so observed posted speeds cannot
+    # exceed the urban cap, while sub-cap class/observed speeds are preserved.
+    urban_cap = road_links["combined_label"].map(urban_flow_speed_dict)
+    urban_mask = road_links["urban"] == 1
+    road_links.loc[urban_mask, "free_flow_speeds"] = np.minimum(
+        pd.to_numeric(road_links.loc[urban_mask, "free_flow_speeds"], errors="coerce"),
+        pd.to_numeric(urban_cap[urban_mask], errors="coerce"),
+    )
     road_links["min_flow_speeds"] = road_links.combined_label.map(min_flow_speed_dict)
     road_links["initial_flow_speeds"] = road_links["free_flow_speeds"]
     road_links["breakpoint_flows"] = road_links.combined_label.map(flow_breakpoint_dict)
@@ -2445,7 +2475,7 @@ def network_flow_model(
     """
 
     road_links_columns = road_links.columns.tolist()
-    total_remain = remain_od["Car21"].sum()
+    total_remain = float(pd.to_numeric(remain_od["Car21"], errors="coerce").fillna(0).sum())
     logging.info(f"The initial supply is {total_remain}")
     number_of_edges = len(list(network.es))
     logging.info(f"The initial number of edges in the network: {number_of_edges}")
@@ -2456,7 +2486,7 @@ def network_flow_model(
 
     # starts
     total_cost = cost_time = cost_fuel = cost_toll = cost_fare = 0
-    initial_sumod = remain_od["Car21"].sum()
+    initial_sumod = float(pd.to_numeric(remain_od["Car21"], errors="coerce").fillna(0).sum())
     assigned_sumod = 0
     iter_flag = 1
     next_od_id_base = 0
@@ -2699,16 +2729,31 @@ def network_flow_model(
         gc.collect()
 
         conn.execute("DROP TABLE IF EXISTS temp_flow_matrix_input")
-        conn.execute(
-            """
-            CREATE TABLE temp_flow_matrix_input (
-                origin VARCHAR,
-                destination VARCHAR,
-                path INT[],
-                flow DOUBLE
-            );
-            """
-        )
+        od_id_at_insert = _env_flag("NIRD_OD_ID_AT_INSERT")
+        lcp_collect_pool = _env_flag("NIRD_LCP_COLLECT_POOL_RESULTS")
+        if od_id_at_insert:
+            conn.execute(
+                """
+                CREATE TABLE temp_flow_matrix_input (
+                    od_id BIGINT,
+                    origin VARCHAR,
+                    destination VARCHAR,
+                    path INT[],
+                    flow DOUBLE
+                );
+                """
+            )
+        else:
+            conn.execute(
+                """
+                CREATE TABLE temp_flow_matrix_input (
+                    origin VARCHAR,
+                    destination VARCHAR,
+                    path INT[],
+                    flow DOUBLE
+                );
+                """
+            )
         conn.execute("DROP TABLE IF EXISTS temp_isolated_flow_matrix")
         conn.execute(
             """
@@ -2726,12 +2771,22 @@ def network_flow_model(
         logging.info(f"Flow DB insert batch size: {batch_size:,}")
 
         def flush_flow_batch() -> None:
-            nonlocal flow_batch
+            nonlocal flow_batch, next_od_id_base
             if not flow_batch:
                 return
-            batch_df = pd.DataFrame(
-                flow_batch, columns=["origin", "destination", "path", "flow"]
-            )
+            if od_id_at_insert:
+                rows = []
+                for origin, destination, path, flow in flow_batch:
+                    rows.append((next_od_id_base, origin, destination, path, flow))
+                    next_od_id_base += 1
+                batch_df = pd.DataFrame(
+                    rows,
+                    columns=["od_id", "origin", "destination", "path", "flow"],
+                )
+            else:
+                batch_df = pd.DataFrame(
+                    flow_batch, columns=["origin", "destination", "path", "flow"]
+                )
             conn.register("temp_flow_batch", batch_df)
             conn.execute(
                 "INSERT INTO temp_flow_matrix_input SELECT * FROM temp_flow_batch"
@@ -2768,37 +2823,61 @@ def network_flow_model(
                 if len(isolated_batch) >= batch_size:
                     flush_isolated_batch()
 
+        def _log_lcp_progress(i: int, total: int) -> None:
+            if i == 1 or i % 10 == 0 or i == total:
+                logging.info(
+                    f"Completed {i} of {total}, {100 * i / total:.2f}%"
+                )
+
         # batch-processing
-        st = time.time()
+        lcp_pool_st = time.time()
+        pool_kwargs = {
+            "processes": num_of_cpu,
+            "initializer": worker_init_path,
+            "initargs": (shared_network_pkl,),
+        }
+        max_tasks_per_child = int(os.environ.get("NIRD_POOL_MAX_TASKS_PER_CHILD", "0"))
+        if max_tasks_per_child > 0:
+            pool_kwargs["maxtasksperchild"] = max_tasks_per_child
+
         if num_of_cpu > 1:
-            with Pool(
-                processes=num_of_cpu,
-                initializer=worker_init_path,
-                initargs=(shared_network_pkl,),
-            ) as pool:
-                for i, shortest_path in enumerate(
-                    pool.imap_unordered(find_least_cost_path, args), start=1
-                ):
-                    handle_shortest_path(shortest_path)
-                    if i == 1 or i % 10 == 0 or i == len(args):
-                        logging.info(
-                            f"Completed {i} of {len(args)}, {100 * i / len(args):.2f}%"
-                        )
+            with Pool(**pool_kwargs) as pool:
+                if lcp_collect_pool:
+                    pool_results = list(pool.imap_unordered(find_least_cost_path, args))
+                else:
+                    for i, shortest_path in enumerate(
+                        pool.imap_unordered(find_least_cost_path, args), start=1
+                    ):
+                        handle_shortest_path(shortest_path)
+                        _log_lcp_progress(i, len(args))
         else:
             global shared_network
             shared_network = network
-            for i, shortest_path in enumerate(
-                (find_least_cost_path(arg) for arg in args), start=1
-            ):
-                handle_shortest_path(shortest_path)
-                if i == 1 or i % 10 == 0 or i == len(args):
-                    logging.info(
-                        f"Completed {i} of {len(args)}, {100 * i / len(args):.2f}%"
-                    )
+            if lcp_collect_pool:
+                pool_results = [find_least_cost_path(arg) for arg in args]
+            else:
+                for i, shortest_path in enumerate(
+                    (find_least_cost_path(arg) for arg in args), start=1
+                ):
+                    handle_shortest_path(shortest_path)
+                    _log_lcp_progress(i, len(args))
 
-        flush_flow_batch()
-        flush_isolated_batch()
-        logging.info(f"The least-cost path flow allocation time: {time.time() - st}.")
+        lcp_pool_sec = time.time() - lcp_pool_st
+        logging.info(f"The least-cost path flow allocation time: {lcp_pool_sec}.")
+
+        if lcp_collect_pool:
+            lcp_db_st = time.time()
+            for i, shortest_path in enumerate(pool_results, start=1):
+                handle_shortest_path(shortest_path)
+                _log_lcp_progress(i, len(pool_results))
+            flush_flow_batch()
+            flush_isolated_batch()
+            logging.info(
+                f"LCP DuckDB insert phase: {time.time() - lcp_db_st:.2f} seconds"
+            )
+        else:
+            flush_flow_batch()
+            flush_isolated_batch()
 
         temp_isolation = (
             conn.execute(
@@ -2841,29 +2920,42 @@ def network_flow_model(
             logging.info("Stop: no remaining flows!")
             conn.execute("DROP TABLE IF EXISTS temp_flow_matrix_input")
             break
+        od_id_st = time.time()
+        if od_id_at_insert:
+            logging.info(
+                "Assigning od_id during LCP inserts; skipping ROW_NUMBER rewrite for %s path rows.",
+                f"{temp_flow_count:,}",
+            )
+        else:
+            logging.info(
+                "Assigning stable od_id values %s to %s for %s path rows.",
+                next_od_id_base,
+                next_od_id_base + temp_flow_count - 1,
+                temp_flow_count,
+            )
+            conn.execute(
+                f"""
+                CREATE OR REPLACE TABLE temp_flow_matrix_input_indexed AS
+                SELECT
+                    CAST({next_od_id_base} + ROW_NUMBER() OVER (
+                        ORDER BY origin, destination
+                    ) - 1 AS BIGINT) AS od_id,
+                    origin,
+                    destination,
+                    path,
+                    flow
+                FROM temp_flow_matrix_input;
+                """
+            )
+            conn.execute("DROP TABLE temp_flow_matrix_input")
+            conn.execute(
+                "ALTER TABLE temp_flow_matrix_input_indexed RENAME TO temp_flow_matrix_input"
+            )
+            next_od_id_base += temp_flow_count
         logging.info(
-            "Assigning stable od_id values %s to %s for %s path rows.",
-            next_od_id_base,
-            next_od_id_base + temp_flow_count - 1,
-            temp_flow_count,
+            "od_id assignment phase: %.2f seconds",
+            time.time() - od_id_st,
         )
-        conn.execute(
-            f"""
-            CREATE OR REPLACE TABLE temp_flow_matrix_input_indexed AS
-            SELECT
-                CAST({next_od_id_base} + ROW_NUMBER() OVER (
-                    ORDER BY origin, destination
-                ) - 1 AS BIGINT) AS od_id,
-                origin,
-                destination,
-                path,
-                flow
-            FROM temp_flow_matrix_input;
-            """
-        )
-        conn.execute("DROP TABLE temp_flow_matrix_input")
-        conn.execute("ALTER TABLE temp_flow_matrix_input_indexed RENAME TO temp_flow_matrix_input")
-        next_od_id_base += temp_flow_count
 
         # %%
         logging.info("Create temp_flow_matrix table in duckdb...")
