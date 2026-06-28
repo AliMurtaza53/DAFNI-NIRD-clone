@@ -47,15 +47,21 @@ Outputs under `lodes_data/processed/` (or `NIRD_LODES_DATA_ROOT/processed/`):
 |----------|---------|
 | `NIRD_LODES_DATA_ROOT` | Local mirror of LODES8 files (recommended for CONUS builds) |
 | `NIRD_LODES8_BASE_URL` | Override download base URL |
+| `NIRD_PASSENGER_OD_PATH` | Passenger assignment parquet for Script 1 / Script 4 |
+| `NIRD_ENABLE_PASSENGER_REROUTING` | Set to `1` to run passenger rerouting in Script 4 |
 
-## Multi-state / CONUS notes
+## Full passenger + freight workflow
 
-For each state, the builder reads **both** `od_main` and `od_aux` files so cross-state commutes are captured once (workplace in state, home anywhere). National county OD is produced by concatenating all states and re-aggregating on `(origin_county, destination_county)`.
+```powershell
+# Build LODES county OD + network mapping, then Pass A/B with combined OD
+powershell -File scripts/run_passenger_freight_conus.ps1 -MaxFlowIterations 0
 
-Use a local mirror for full CONUS; raw downloads are large and slow.
+# Or use Patch 5 directly once assignment OD exists
+powershell -File scripts/run_patch5_recovery_conus.ps1 -IncludePassenger -MaxFlowIterations 0
+```
 
-## Next steps
+Script 1 merges freight FAF5 OD with passenger `Car21` when `NIRD_PASSENGER_OD_PATH` is set.
+Script 4 writes `cost_matrix_passenger_by_scenario.csv` alongside freight `cost_matrix_by_scenario.csv`.
 
-- Split or downscale inner-county flows to sub-county zones.
-- Run Script 1 Pass A with passenger assignment OD (`vehicle_type=car`) alongside freight.
+Missing LODES files are downloaded on demand into `data/lodes_data/{state}/` when no local mirror is populated.
 - Hazard/rerouting coupling for passenger mode in Script 4.

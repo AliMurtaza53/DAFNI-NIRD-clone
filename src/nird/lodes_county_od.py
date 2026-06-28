@@ -19,10 +19,14 @@ import pandas as pd
 
 from nird.lodes_paths import (
     CONUS_STATE_ABBRS,
+    DEFAULT_LODES8_BASE_URL,
+    STATE_LODES_YEAR_OVERRIDES,
     crosswalk_file_path,
+    effective_lodes_year,
     lodes_base_url,
     od_file_path,
     resolve_lodes_data_root,
+    resolve_lodes_read_path,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -52,14 +56,27 @@ def read_lodes_od(
     base: str | Path | None = None,
 ) -> pd.DataFrame:
     """Read one LODES OD file (main or aux) for a state."""
-    path = od_file_path(state, job_type=job_type, year=year, part=part, base=base)
+    read_year = effective_lodes_year(state, year)
+    if read_year != year:
+        LOGGER.info("Using LODES year=%s for state=%s (requested year=%s)", read_year, state, year)
+    local_path = od_file_path(state, job_type=job_type, year=read_year, part=part, base=base)
+    remote_url = od_file_path(
+        state,
+        job_type=job_type,
+        year=read_year,
+        part=part,
+        base=DEFAULT_LODES8_BASE_URL,
+    )
+    path = resolve_lodes_read_path(local_path, remote_url)
     LOGGER.info("Reading LODES OD: %s", path)
     return pd.read_csv(path, dtype={"h_geocode": str, "w_geocode": str}, usecols=OD_READ_COLUMNS)
 
 
 def read_lodes_crosswalk(state: str, *, base: str | Path | None = None) -> pd.DataFrame:
     """Read block-to-county crosswalk for one state."""
-    path = crosswalk_file_path(state, base=base)
+    local_path = crosswalk_file_path(state, base=base)
+    remote_url = crosswalk_file_path(state, base=DEFAULT_LODES8_BASE_URL)
+    path = resolve_lodes_read_path(local_path, remote_url)
     LOGGER.info("Reading LODES crosswalk: %s", path)
     xwalk = pd.read_csv(path, dtype=str, usecols=CROSSWALK_COLUMNS)
     xwalk["tabblk2020"] = xwalk["tabblk2020"].astype(str)
@@ -149,23 +166,37 @@ def build_conus_county_od(
     job_type: str = "JT00",
     year: int = 2022,
     base: str | Path | None = None,
+    parts_dir: str | Path | None = None,
+    resume: bool = True,
 ) -> pd.DataFrame:
     """Aggregate LODES OD to county-to-county flows for many states."""
     selected = [s.lower() for s in (states or list(CONUS_STATE_ABBRS))]
     lookup = build_block_county_lookup(selected, base=base)
 
+    parts_path = Path(parts_dir) if parts_dir is not None else None
+    if parts_path is not None:
+        parts_path.mkdir(parents=True, exist_ok=True)
+
     pieces: list[pd.DataFrame] = []
     for state in selected:
+        part_file = parts_path / f"{state}_{job_type.lower()}_{year}.parquet" if parts_path else None
+        if resume and part_file is not None and part_file.exists():
+            LOGGER.info("Reusing LODES county OD part for state=%s -> %s", state, part_file)
+            pieces.append(pd.read_parquet(part_file))
+            continue
+
         LOGGER.info("Building LODES county OD for state=%s", state)
-        pieces.append(
-            build_state_county_od(
-                state,
-                job_type=job_type,
-                year=year,
-                base=base,
-                block_county_lookup=lookup,
-            )
+        state_od = build_state_county_od(
+            state,
+            job_type=job_type,
+            year=year,
+            base=base,
+            block_county_lookup=lookup,
         )
+        if part_file is not None:
+            state_od.to_parquet(part_file, index=False)
+            LOGGER.info("Wrote state part %s (%s rows)", part_file, len(state_od))
+        pieces.append(state_od)
 
     if not pieces:
         return pd.DataFrame(columns=COUNTY_OD_COLUMNS)
@@ -216,13 +247,23 @@ def run_lodes_county_od(
     base_path: Path | None = None,
     repo_root: Path | None = None,
     summary_json_path: str | Path | None = None,
+    parts_dir: str | Path | None = None,
+    resume: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """Build and write county-to-county LODES passenger OD."""
     local_root = resolve_lodes_data_root(base_path, repo_root)
     base = lodes_base_url(local_root)
-
-    county_od = build_conus_county_od(states=states, job_type=job_type, year=year, base=base)
     out = Path(output_path)
+    parts_path = Path(parts_dir) if parts_dir is not None else out.parent / "state_parts"
+
+    county_od = build_conus_county_od(
+        states=states,
+        job_type=job_type,
+        year=year,
+        base=base,
+        parts_dir=parts_path,
+        resume=resume,
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     county_od.to_parquet(out, index=False)
 
@@ -233,10 +274,12 @@ def run_lodes_county_od(
         "year": year,
         "lodes_base": base,
         "local_root": str(local_root) if local_root else None,
+        "state_year_overrides": STATE_LODES_YEAR_OVERRIDES,
         "county_pairs": int(len(county_od)),
         "total_jobs": float(county_od["jobs"].sum()) if not county_od.empty else 0.0,
         "unique_origin_counties": int(county_od["origin_county"].nunique()) if not county_od.empty else 0,
         "unique_destination_counties": int(county_od["destination_county"].nunique()) if not county_od.empty else 0,
+        "state_parts_dir": str(parts_path),
     }
     if summary_json_path:
         summary_path = Path(summary_json_path)

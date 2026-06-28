@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import urllib.request
 from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_LODES8_BASE_URL = "https://lehd.ces.census.gov/data/lodes/LODES8/"
 
@@ -15,6 +19,17 @@ CONUS_STATE_ABBRS: tuple[str, ...] = (
     "nj", "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri",
     "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv", "wi", "wy",
 )
+
+# Census publication lags differ by state; use the latest available OD year when needed.
+STATE_LODES_YEAR_OVERRIDES: dict[str, int] = {
+    "ak": 2016,
+    "mi": 2021,
+}
+
+
+def effective_lodes_year(state: str, year: int) -> int:
+    """Return the OD release year to read for one state."""
+    return STATE_LODES_YEAR_OVERRIDES.get(state.lower(), year)
 
 
 def resolve_lodes_data_root(base_path: Path | None = None, repo_root: Path | None = None) -> Path | None:
@@ -69,3 +84,25 @@ def crosswalk_file_path(state: str, *, base: str | Path | None = None) -> str:
     st = state.lower()
     root = lodes_base_url(Path(base) if isinstance(base, Path) else None) if base is None else str(base).rstrip("/") + "/"
     return f"{root}{st}/{st}_xwalk.csv.gz"
+
+
+def ensure_lodes_cached(local_path: str, remote_url: str) -> str:
+    """Return a readable local path, downloading from Census when the cache file is missing."""
+    if local_path.startswith("http://") or local_path.startswith("https://"):
+        return local_path
+
+    path = Path(local_path)
+    if path.exists():
+        return str(path)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Downloading LODES file %s -> %s", remote_url, path)
+    urllib.request.urlretrieve(remote_url, path)
+    return str(path)
+
+
+def resolve_lodes_read_path(local_path: str, remote_url: str) -> str:
+    """Use a local cache file when configured; otherwise read directly from the remote URL."""
+    if local_path.startswith("http://") or local_path.startswith("https://"):
+        return local_path
+    return ensure_lodes_cached(local_path, remote_url)
