@@ -716,6 +716,9 @@ def main():
         intersections_with_damage = calculate_damage(
             intersections, damage_curves, damage_values
         )
+        from nird.damage_aggregation import add_consolidated_damage_columns
+
+        intersections_with_damage = add_consolidated_damage_columns(intersections_with_damage)
         # filter out undamaged intersections
         intersections_with_damage = intersections_with_damage[
             ~(

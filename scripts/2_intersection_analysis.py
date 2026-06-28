@@ -34,15 +34,21 @@ from shapely.geometry import box
 
 from snail import intersection
 from nird.utils import get_results_variant, load_config
+from nird.geo_runtime import (
+    CONUS_TARGET_CRS,
+    align_extent_to_features_crs,
+    build_snail_grid,
+    configure_geo_runtime,
+    rasterio_env,
+)
 import warnings
 import logging
-import pyproj
 
 warnings.filterwarnings("ignore")
 
 base_path = Path(load_config()["paths"]["soge_clusters"])
 raster_path = base_path / "hazards" / "completed"
-TARGET_CRS = "EPSG:2163"  # US National Atlas Equal Area (use for USA networks)
+TARGET_CRS = CONUS_TARGET_CRS
 
 # Optional performance controls (disabled by default)
 SPLIT_SIMPLIFY_TOLERANCE_M = float(os.environ.get("NIRD_SPLIT_SIMPLIFY_TOLERANCE_M", "0"))
@@ -53,49 +59,7 @@ ENABLE_SPLIT_CACHE = os.environ.get("NIRD_ENABLE_SPLIT_CACHE", "0").strip().lowe
 }
 _SPLIT_CACHE = {}
 
-
-def configure_proj_runtime() -> Optional[Path]:
-    """Ensure PROJ can find proj.db for CRS transforms (Rasterio/GDAL/PROJ)."""
-    candidate_dirs = []
-
-    # Prefer environment-local data first (avoid stale external PROJ_LIB overrides)
-    candidate_dirs.append(Path(rasterio.__file__).resolve().parent / "proj_data")
-
-    try:
-        proj_data_dir = pyproj.datadir.get_data_dir()
-        if proj_data_dir:
-            candidate_dirs.append(Path(proj_data_dir))
-    except Exception:
-        pass
-
-    # Consider explicit env vars after local defaults
-    for key in ("PROJ_DATA", "PROJ_LIB"):
-        val = os.environ.get(key)
-        if val:
-            candidate_dirs.append(Path(val))
-
-    for cdir in candidate_dirs:
-        try:
-            if cdir.exists() and (cdir / "proj.db").exists():
-                # Set both for compatibility across PROJ versions / GDAL builds
-                os.environ["PROJ_DATA"] = str(cdir)
-                os.environ["PROJ_LIB"] = str(cdir)
-                try:
-                    pyproj.datadir.set_data_dir(str(cdir))
-                except Exception:
-                    pass
-                logging.info(f"Using PROJ data directory: {cdir}")
-                return cdir
-        except Exception:
-            continue
-
-    logging.warning(
-        "Could not locate proj.db. Set PROJ_DATA (or PROJ_LIB) to a directory containing proj.db."
-    )
-    return None
-
-
-configure_proj_runtime()
+configure_geo_runtime()
 
 
 def first_existing(paths):
@@ -140,14 +104,6 @@ def log_summary(label: str, gdf: gpd.GeoDataFrame) -> None:
         logging.info(f"{label} damage_level_max counts: {counts.to_dict()}")
 
 
-def _is_us_national_atlas_alias(crs) -> bool:
-    """Return True for LOCAL_CS aliases of EPSG:2163 used by toy rasters."""
-    if crs is None:
-        return False
-    crs_text = str(crs)
-    return "US National Atlas Equal Area" in crs_text or "2163" in crs_text
-
-
 def subset_features_to_raster_extent(
     features: gpd.GeoDataFrame,
     flood_path: str,
@@ -161,11 +117,7 @@ def subset_features_to_raster_extent(
     if features.empty:
         return features
 
-    with rasterio.Env(
-        PROJ_DATA=os.environ.get("PROJ_DATA"),
-        PROJ_LIB=os.environ.get("PROJ_LIB"),
-        GTIFF_SRS_SOURCE="EPSG",
-    ):
+    with rasterio_env():
         with rasterio.open(flood_path) as dataset:
             bounds = dataset.bounds
             raster_crs = dataset.crs
@@ -186,7 +138,6 @@ def subset_features_to_raster_extent(
         )
         return features
 
-    extent = gpd.GeoDataFrame({"source": [Path(flood_path).name]}, geometry=[extent_geom], crs=raster_crs)
     if features.crs is None:
         logging.warning(
             "Road links have no CRS; skipping raster-extent feature prefilter for %s",
@@ -194,25 +145,12 @@ def subset_features_to_raster_extent(
         )
         return features
 
-    if extent.crs != features.crs:
-        try:
-            extent = extent.to_crs(features.crs)
-        except Exception as exc:
-            if _is_us_national_atlas_alias(raster_crs) and _is_us_national_atlas_alias(features.crs):
-                logging.warning(
-                    "Raster CRS is a US National Atlas alias; applying raster bounds in feature CRS "
-                    "without reprojection."
-                )
-                extent = gpd.GeoDataFrame(
-                    {"source": [Path(flood_path).name]},
-                    geometry=[extent_geom],
-                    crs=features.crs,
-                )
-            else:
-                raise RuntimeError(
-                    "Could not transform raster extent to road-link CRS for prefiltering. "
-                    f"Raster={flood_path}; details: {exc}"
-                ) from exc
+    extent = align_extent_to_features_crs(
+        extent_geom,
+        raster_crs=raster_crs,
+        features_crs=features.crs,
+        source_name=Path(flood_path).name,
+    )
 
     before = len(features)
     extent_polygon = extent.geometry.iloc[0]
@@ -302,71 +240,15 @@ def intersect_features_with_raster(
     # run the intersection analysis using a windowed raster read
     prepared = intersection.prepare_linestrings(features_min)
 
-    with rasterio.Env(
-        PROJ_DATA=os.environ.get("PROJ_DATA"),
-        PROJ_LIB=os.environ.get("PROJ_LIB"),
-        GTIFF_SRS_SOURCE="EPSG",
-    ):
-        dataset = rasterio.open(raster_path)
+    with rasterio_env():
+        with rasterio.open(raster_path) as dataset:
+            grid_result = build_snail_grid(dataset, prepared, target_crs=TARGET_CRS)
+            prepared = grid_result.prepared
+            grid = grid_result.grid
+            raster = grid_result.raster
 
-    with dataset:
-        grid_full = intersection.GridDefinition.from_rasterio_dataset(dataset)
-        grid_crs = grid_full.crs
-        if prepared.crs != grid_full.crs:
-            logging.info("Projecting Feature (clipped) CRS to Grid CRS...")
-            try:
-                prepared = prepared.to_crs(grid_full.crs)
-            except Exception as e:
-                # Some toy rasters use LOCAL_CS naming for US National Atlas Equal Area.
-                # If that happens, keep features in their CRS and align grid CRS to match.
-                grid_crs_text = "" if grid_full.crs is None else str(grid_full.crs)
-                if (
-                    prepared.crs is not None
-                    and "US National Atlas Equal Area" in grid_crs_text
-                    and str(prepared.crs).find("2163") != -1
-                ):
-                    logging.warning(
-                        "Raster CRS is LOCAL_CS alias of US National Atlas Equal Area; "
-                        "using feature CRS for grid alignment without reprojection."
-                    )
-                    grid_crs = prepared.crs
-                else:
-                    raise RuntimeError(
-                        "CRS transform to raster grid failed. "
-                        "Aborting to avoid invalid mixed-CRS intersections. "
-                        "Fix PROJ/CRS configuration first. "
-                        f"Details: {e}"
-                    )
-
-        if prepared.empty:
-            return prepared
-
-        # Compute a raster window from feature bounds to avoid loading global raster
-        minx, miny, maxx, maxy = prepared.total_bounds
-        pad_x = abs(dataset.transform.a) * 2
-        pad_y = abs(dataset.transform.e) * 2
-        minx, miny, maxx, maxy = (
-            minx - pad_x,
-            miny - pad_y,
-            maxx + pad_x,
-            maxy + pad_y,
-        )
-
-        window = rasterio.windows.from_bounds(
-            minx, miny, maxx, maxy, transform=dataset.transform
-        )
-        window = window.round_offsets().round_lengths()
-        full_window = rasterio.windows.Window(0, 0, dataset.width, dataset.height)
-        window = window.intersection(full_window)
-
-        raster = dataset.read(1, window=window)
-        window_transform = dataset.window_transform(window)
-        grid = intersection.GridDefinition(
-            crs=grid_crs,
-            width=int(window.width),
-            height=int(window.height),
-            transform=tuple(window_transform)[:6],
-        )
+    if prepared.empty:
+        return prepared
 
     if SPLIT_SIMPLIFY_TOLERANCE_M > 0:
         prepared = prepared.copy()

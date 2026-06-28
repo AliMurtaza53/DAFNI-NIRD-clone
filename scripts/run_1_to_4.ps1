@@ -12,6 +12,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $logDir = Join-Path $repoRoot "logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
+. (Join-Path $PSScriptRoot "lib\nird_geo_env.ps1") -Python $Python
+
 Remove-Item Env:NIRD_OD_MULTIPLIER -ErrorAction SilentlyContinue
 Remove-Item Env:NIRD_OD_TARGET_TOTAL -ErrorAction SilentlyContinue
 

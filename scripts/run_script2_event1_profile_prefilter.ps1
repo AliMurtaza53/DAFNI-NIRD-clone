@@ -9,6 +9,8 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
 
+. (Join-Path $PSScriptRoot "lib\nird_geo_env.ps1") -Python $Python
+
 $env:PYTHONIOENCODING = "utf-8"
 $env:NIRD_ENABLE_SPLIT_CACHE = "1"
 $env:NIRD_TOY_FLOOD_TYPES = "flood"

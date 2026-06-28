@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 import pandas as pd
+from nird.damage_aggregation import add_consolidated_damage_columns, total_direct_damage_musd
 from nird.utils import get_results_variant, load_config
 import warnings
 import logging
@@ -13,14 +14,11 @@ results_root = base_path.parent / "results" / "damage_analysis" / get_results_va
 
 # %%
 def compute_edge_damage(intersections):
+    intersections = add_consolidated_damage_columns(intersections)
     edges_with_damage = (
-        pd.concat(
-            [intersections[["e_id"]], intersections.filter(like="_damage_value_")],
-            axis=1,
-        )
-        .fillna(0)
-        .groupby(by=["e_id"], as_index=False)
+        intersections.groupby("e_id", as_index=False)["direct_damage_mean_musd"]
         .sum()
+        .rename(columns={"direct_damage_mean_musd": "edge_direct_damage_mean_musd"})
     )
     return edges_with_damage
 
@@ -46,8 +44,8 @@ for event_path in intersections_list:
     # integrate damage from segments to edges
     edges_with_damage = compute_edge_damage(intersections)
     flood_key = event_path.stem.split("_")[1]
-    min_cost = edges_with_damage.filter(like="damage_value_min").max(axis=1).sum()
-    max_cost = edges_with_damage.filter(like="damage_value_max").max(axis=1).sum()
+    min_cost = float(edges_with_damage["edge_direct_damage_mean_musd"].sum())
+    max_cost = min_cost
 
     # more attributes should be added
     event_list.append(flood_key)
@@ -57,11 +55,12 @@ for event_path in intersections_list:
 temp = pd.DataFrame(
     {
         "event_id": event_list,
-        "damage_cost_min": min_cost_list,
-        "damage_cost_max": max_cost_list,
+        "damage_cost_min_musd": min_cost_list,
+        "damage_cost_max_musd": max_cost_list,
     }
 )
-temp["damage_cost_mean"] = temp[["damage_cost_min", "damage_cost_max"]].mean(axis=1)
+temp["damage_cost_mean_musd"] = temp[["damage_cost_min_musd", "damage_cost_max_musd"]].mean(axis=1)
+temp["damage_cost_mean_usd"] = temp["damage_cost_mean_musd"] * 1_000_000.0
 
 summary_path = results_root / "damage_summary.csv"
 summary_path.parent.mkdir(parents=True, exist_ok=True)

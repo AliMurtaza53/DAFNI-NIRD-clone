@@ -12,6 +12,7 @@ import geopandas as gpd  # type: ignore
 import duckdb
 
 from nird.utils import get_results_variant, load_config
+from nird.combined_od import load_combined_assignment_od, resolve_passenger_od_path
 import nird.road_revised as func
 
 import logging
@@ -132,6 +133,33 @@ def main(
     )
     if od_flow_col is None:
         raise ValueError("OD matrix must contain either 'Car21' or 'flow' column")
+
+    passenger_path = os.environ.get("NIRD_PASSENGER_OD_PATH") or resolve_passenger_od_path(base_path)
+    if passenger_path is not None:
+        od_node_2021, od_stats = load_combined_assignment_od(
+            od_node_2021,
+            passenger_path=passenger_path,
+            freight_flow_col=od_flow_col,
+        )
+        od_flow_col = "Car21"
+        logging.info(
+            "Combined freight+passenger OD: freight=%.3f passenger=%.3f total=%.3f from %s",
+            od_stats["freight_flow"],
+            od_stats["passenger_flow"],
+            od_stats["combined_flow"],
+            passenger_path,
+        )
+    else:
+        logging.info("Passenger OD not configured; using freight-only assignment demand.")
+
+    # Smoke-test cap: when sampling, also bound the *combined* OD so passenger demand
+    # (merged in full above) does not blow the row count back up. Random sample keeps a
+    # representative freight+passenger mix for validating the integrated assignment.
+    if sample_od_n > 0 and len(od_node_2021) > sample_od_n:
+        logging.info(f"Capping combined OD to first {sample_od_n:,} rows for smoke test")
+        od_node_2021 = od_node_2021.sample(
+            n=sample_od_n, random_state=42
+        ).reset_index(drop=True)
 
     od_node_2021[od_flow_col] = pd.to_numeric(
         od_node_2021[od_flow_col], errors="coerce"

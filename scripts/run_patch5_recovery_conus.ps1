@@ -15,7 +15,9 @@ param(
     [switch]$SkipScript4,
     [switch]$RunVizOdpfcSidecar,
     [int]$VizSampleStride = 1,
-    [switch]$RunNotebook
+    [switch]$RunNotebook,
+    [switch]$IncludePassenger,
+    [int]$LodesYear = 2022
 )
 
 $ErrorActionPreference = "Stop"
@@ -204,9 +206,33 @@ if ($SmokeOnly) {
     Write-Host "  Mode:      smoke only (MaxFlowIterations=$MaxFlowIterations)"
 }
 
+if ($IncludePassenger) {
+    Write-Host "  Passenger: enabled (LODES year $LodesYear)"
+}
+
 Push-Location $repoRoot
 try {
     Set-Patch5SharedEnv
+
+    if ($IncludePassenger) {
+        $lodesProcessed = Join-Path (Split-Path -Parent $basePath) "lodes_data\processed"
+        $lodesAssignment = Join-Path $lodesProcessed "lodes_passenger_assignment_od_jt00_$LodesYear.parquet"
+        if (-not (Test-Path -LiteralPath $lodesAssignment)) {
+            Invoke-Step "build_lodes_passenger_od" @(
+                "scripts/build_lodes_passenger_od.py",
+                "--year", "$LodesYear"
+            )
+        }
+        else {
+            Write-Host "Reusing passenger assignment OD: $lodesAssignment"
+        }
+        $env:NIRD_PASSENGER_OD_PATH = $lodesAssignment
+        $env:NIRD_ENABLE_PASSENGER_REROUTING = "1"
+    }
+    else {
+        Remove-Item Env:NIRD_PASSENGER_OD_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:NIRD_ENABLE_PASSENGER_REROUTING -ErrorAction SilentlyContinue
+    }
 
     try {
         Invoke-Step "build_faf5_sctg_summary" @("scripts/build_faf5_sctg_summary.py")
