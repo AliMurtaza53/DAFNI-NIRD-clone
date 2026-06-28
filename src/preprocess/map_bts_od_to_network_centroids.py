@@ -78,12 +78,29 @@ def read_table(path: str | Path) -> pd.DataFrame:
     if suffix == ".csv":
         return _clean_columns(pd.read_csv(table_path, dtype=str, low_memory=False))
     if suffix in {".pq", ".parquet", ".gpq"}:
+        errors: list[str] = []
         if gpd is not None:
             try:
                 return _clean_columns(gpd.read_parquet(table_path))
-            except Exception:
-                pass
-        return _clean_columns(pd.read_parquet(table_path))
+            except Exception as exc:
+                errors.append(f"geoparquet: {exc}")
+        try:
+            return _clean_columns(pd.read_parquet(table_path))
+        except Exception as exc:
+            errors.append(f"parquet: {exc}")
+        if gpd is not None:
+            try:
+                return _clean_columns(gpd.read_file(table_path))
+            except Exception as exc:
+                errors.append(f"geopackage: {exc}")
+        try:
+            return _clean_columns(pd.read_csv(table_path, dtype=str, low_memory=False))
+        except Exception as exc:
+            errors.append(f"csv: {exc}")
+        raise ValueError(
+            f"Could not read {table_path} as parquet/geopackage/csv. "
+            f"Errors: {' | '.join(errors)}"
+        )
     if suffix in {".gpkg", ".geojson", ".shp"}:
         if gpd is None:
             raise ImportError("geopandas is required to read geospatial inputs")
@@ -98,14 +115,32 @@ def read_network_centroid_table(path: str | Path, layer: str = "FAF5_Nodes") -> 
     if table_path.suffix.lower() == ".gdb":
         if gpd is None:
             raise ImportError("geopandas is required to read FAF5 geodatabases")
+        if table_path.is_dir():
+            payload = sum(f.stat().st_size for f in table_path.rglob("*") if f.is_file())
+            if payload < 50_000_000:
+                raise FileNotFoundError(
+                    f"{table_path} appears incomplete ({payload / 1_048_576:.2f} MB). "
+                    "Replace it with the full FAF5Network.gdb download, or pass an exported "
+                    "centroid parquet via --network-centroids / NIRD_FAF5_NETWORK_CENTROIDS_PATH."
+                )
+        errors: list[str] = []
+        for engine in ("pyogrio", "fiona"):
+            try:
+                centroids = gpd.read_file(table_path, layer=layer, engine=engine, where="Centroid = 1")
+                return _clean_columns(centroids)
+            except Exception as exc:
+                errors.append(f"{engine}: {exc}")
         try:
-            centroids = gpd.read_file(table_path, layer=layer, engine="pyogrio", where="Centroid = 1")
-        except Exception:
             nodes = gpd.read_file(table_path, layer=layer, engine="pyogrio")
             if "Centroid" not in nodes.columns:
                 raise ValueError(f"{table_path} layer {layer!r} does not contain a Centroid column")
             centroids = nodes[nodes["Centroid"] == 1].copy()
-        return _clean_columns(centroids)
+            return _clean_columns(centroids)
+        except Exception as exc:
+            errors.append(f"pyogrio-unfiltered: {exc}")
+        raise FileNotFoundError(
+            f"Could not open {table_path}. GDAL errors: {' | '.join(errors)}"
+        )
     return read_table(table_path)
 
 
@@ -468,11 +503,89 @@ def validation_summary(
 def write_table(df: pd.DataFrame, path: str | Path) -> Path:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.suffix.lower() in {".pq", ".parquet"}:
-        df.to_parquet(output_path, index=False)
+    suffix = output_path.suffix.lower()
+    if suffix in {".pq", ".parquet", ".gpq"}:
+        if gpd is not None and isinstance(df, gpd.GeoDataFrame):
+            df.to_parquet(output_path, index=False)
+        elif gpd is not None and "geometry" in df.columns:
+            gpd.GeoDataFrame(df).to_parquet(output_path, index=False)
+        else:
+            pd.DataFrame(df).to_parquet(output_path, index=False)
     else:
         df.to_csv(output_path, index=False)
     return output_path
+
+
+def map_county_od_via_county_shp(
+    county_od: pd.DataFrame,
+    county_shp_path: str | Path,
+    network_nodes_path: str | Path,
+    *,
+    default_payload_tons: float | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    """Map county OD rows to assignment nodes using county centroids and nearest network nodes."""
+
+    if gpd is None:
+        raise ImportError("geopandas is required for county-shapefile mapping")
+
+    od = normalize_bts_od(county_od, default_payload_tons=default_payload_tons)
+    counties = gpd.read_file(county_shp_path)
+    if "GEOID" not in counties.columns:
+        raise ValueError(f"{county_shp_path} must contain GEOID")
+    counties = counties.assign(county_id=_as_zone_id(counties["GEOID"])).to_crs("EPSG:2163")
+    county_pts = counties[["county_id", "geometry"]].copy()
+    county_pts["geometry"] = county_pts.geometry.centroid
+
+    nodes = read_table(network_nodes_path)
+    if "geometry" not in nodes.columns:
+        raise ValueError(f"{network_nodes_path} must contain geometry")
+    node_gdf = nodes if isinstance(nodes, gpd.GeoDataFrame) else gpd.GeoDataFrame(nodes, geometry="geometry")
+    if node_gdf.crs is None:
+        node_gdf = node_gdf.set_crs("EPSG:4326")
+    node_gdf = node_gdf.to_crs("EPSG:2163")
+    node_gdf = _rename_first(node_gdf, ["node_id", "ID", "id"], "node_id")
+
+    nearest = gpd.sjoin_nearest(
+        county_pts,
+        node_gdf[["node_id", "geometry"]],
+        how="left",
+        distance_col="distance_m",
+    )
+    node_map = nearest[["county_id", "node_id", "distance_m"]].drop_duplicates("county_id")
+
+    mapped = od.copy()
+    mapped["origin_detail_zone"] = _as_zone_id(mapped["origin_detail_zone"])
+    mapped["destination_detail_zone"] = _as_zone_id(mapped["destination_detail_zone"])
+    mapped = mapped.merge(
+        node_map.rename(columns={"county_id": "origin_detail_zone", "node_id": "origin_node"}),
+        on="origin_detail_zone",
+        how="inner",
+    )
+    mapped = mapped.merge(
+        node_map.rename(columns={"county_id": "destination_detail_zone", "node_id": "destination_node"}),
+        on="destination_detail_zone",
+        how="inner",
+    )
+    grouped = mapped.groupby(
+        ["origin_node", "destination_node", "sctgG5", "mode", "year"],
+        as_index=False,
+        dropna=False,
+    ).agg(
+        annual_tons=("annual_tons", "sum"),
+        daily_tons=("daily_tons", "sum"),
+        value=("value", "sum"),
+        annual_truck_trips=("annual_truck_trips", "sum"),
+        daily_truck_trips=("daily_truck_trips", "sum"),
+    )
+    grouped["Car21"] = grouped["daily_truck_trips"]
+    summary = {
+        "mapping_method": "county_shapefile_nearest_node",
+        "county_rows_mapped": int(len(mapped)),
+        "assignment_rows_by_sctg": int(len(grouped)),
+        "counties_in_crosswalk": int(len(node_map)),
+        "unmapped_counties": int(node_map["node_id"].isna().sum()),
+    }
+    return grouped, node_map, summary
 
 
 def run_mapping(

@@ -447,11 +447,16 @@ def convert_tons_to_truck_trips(
     county_od: pd.DataFrame,
     payload_factors: pd.DataFrame | None = None,
     annual_to_daily_factor: float = 365,
+    default_payload_tons: float | None = None,
 ) -> pd.DataFrame:
     """Add annual/daily truck trip fields when payload factors are available."""
 
     result = county_od.copy()
     if payload_factors is None:
+        if default_payload_tons is None:
+            return result
+        result["annual_truck_trips"] = result["tons"] / float(default_payload_tons)
+        result["daily_truck_trips"] = result["annual_truck_trips"] / float(annual_to_daily_factor)
         return result
     payload = _normalize_payload_factors(payload_factors)
     result = result.merge(payload, on="sctgG5", how="left")
@@ -462,6 +467,22 @@ def convert_tons_to_truck_trips(
     result["annual_truck_trips"] = result["tons"] / result["payload_tons"]
     result["daily_truck_trips"] = result["annual_truck_trips"] / float(annual_to_daily_factor)
     return result
+
+
+def add_default_truck_trips(
+    county_od: pd.DataFrame,
+    *,
+    default_payload_tons: float = 20.0,
+    annual_to_daily_factor: float = 365,
+) -> pd.DataFrame:
+    """Convert county tons to truck trips using a single payload assumption."""
+
+    return convert_tons_to_truck_trips(
+        county_od,
+        payload_factors=None,
+        annual_to_daily_factor=annual_to_daily_factor,
+        default_payload_tons=default_payload_tons,
+    )
 
 
 def write_county_od_outputs(county_od: pd.DataFrame, output_path: str | Path) -> Path:

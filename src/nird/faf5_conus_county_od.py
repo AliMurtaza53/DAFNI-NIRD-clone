@@ -21,6 +21,15 @@ from nird import faf5_county_disaggregation as county
 LOGGER = logging.getLogger(__name__)
 
 COUNTY_PAIR_COLUMNS = ["origin_county", "destination_county", "tons", "value"]
+COUNTY_OD_SCTG_COLUMNS = [
+    "origin_county",
+    "destination_county",
+    "sctgG5",
+    "mode",
+    "year",
+    "tons",
+    "value",
+]
 
 
 def _aggregate_detail_to_county_pairs(detail: pd.DataFrame) -> pd.DataFrame:
@@ -89,6 +98,54 @@ def load_faf_regional_totals(
         "input_faf_rows_read": int(total_faf_rows),
         "faf_rows_after_filters": int(kept_faf_rows),
     }
+
+
+def _aggregate_detail_to_county_sctg(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty:
+        return pd.DataFrame(columns=COUNTY_OD_SCTG_COLUMNS)
+    result = detail.copy()
+    result["tons"] = pd.to_numeric(result["tons"], errors="coerce").fillna(0.0)
+    if "value" not in result.columns:
+        result["value"] = 0.0
+    result["value"] = pd.to_numeric(result["value"], errors="coerce").fillna(0.0)
+    return result.groupby(
+        ["origin_county", "destination_county", "sctgG5", "mode", "year"],
+        as_index=False,
+        dropna=False,
+    ).agg(tons=("tons", "sum"), value=("value", "sum"))
+
+
+def _combine_sctg_pieces(pieces: list[pd.DataFrame]) -> pd.DataFrame:
+    if not pieces:
+        return pd.DataFrame(columns=COUNTY_OD_SCTG_COLUMNS)
+    combined = pd.concat(pieces, ignore_index=True)
+    return _aggregate_detail_to_county_sctg(combined)
+
+
+def aggregate_faf_chunk_to_county_sctg(
+    faf_od: pd.DataFrame,
+    origin_factors: pd.DataFrame,
+    destination_factors: pd.DataFrame,
+    *,
+    od_chunk_size: int = 500,
+) -> pd.DataFrame:
+    """Disaggregate regional FAF rows to county OD while preserving sctgG5."""
+
+    if faf_od.empty:
+        return pd.DataFrame(columns=COUNTY_OD_SCTG_COLUMNS)
+
+    pieces: list[pd.DataFrame] = []
+    for start in range(0, len(faf_od), od_chunk_size):
+        chunk = faf_od.iloc[start : start + od_chunk_size].copy()
+        detail = county.disaggregate_faf_to_county(
+            chunk,
+            origin_factors,
+            destination_factors,
+            chunk_size=od_chunk_size,
+        )
+        if not detail.empty:
+            pieces.append(_aggregate_detail_to_county_sctg(detail))
+    return _combine_sctg_pieces(pieces)
 
 
 def aggregate_faf_chunk_to_county_pairs(
@@ -208,26 +265,96 @@ def run_conus_county_od(
     return total_od, summary
 
 
+def run_conus_county_od_by_sctg(
+    faf_od_path: str | Path,
+    origin_factor_path: str | Path,
+    destination_factor_path: str | Path,
+    output_path: str | Path,
+    year: int | str,
+    mode: str | int | None = "truck",
+    tons_unit: str = "thousand_tons",
+    read_chunksize: int = 50_000,
+    od_chunk_size: int = 500,
+    combine_every: int = 50,
+    default_payload_tons: float = 20.0,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Stream FAF5 regional OD to county-to-county OD with sctgG5 preserved."""
+
+    origin_factors, destination_factors = county.load_truck_disaggregation_factors(
+        origin_factor_path,
+        destination_factor_path,
+    )
+
+    faf_totals, faf_summary = load_faf_regional_totals(
+        faf_od_path,
+        year=year,
+        mode=mode,
+        tons_unit=tons_unit,
+        read_chunksize=read_chunksize,
+        combine_every=combine_every,
+    )
+    LOGGER.info("Collapsed FAF rows to %s regional OD/SCTG rows", f"{len(faf_totals):,}")
+
+    pieces: list[pd.DataFrame] = []
+    for start in range(0, len(faf_totals), od_chunk_size):
+        county_chunk = aggregate_faf_chunk_to_county_sctg(
+            faf_totals.iloc[start : start + od_chunk_size],
+            origin_factors,
+            destination_factors,
+            od_chunk_size=od_chunk_size,
+        )
+        if not county_chunk.empty:
+            pieces.append(county_chunk)
+        if len(pieces) >= combine_every:
+            pieces = [_combine_sctg_pieces(pieces)]
+        LOGGER.info(
+            "Expanded %s of %s regional FAF rows",
+            f"{min(start + od_chunk_size, len(faf_totals)):,}",
+            f"{len(faf_totals):,}",
+        )
+
+    county_od = _combine_sctg_pieces(pieces)
+    county_od = county.add_default_truck_trips(county_od, default_payload_tons=default_payload_tons)
+    output = write_total_county_od(county_od, output_path)
+    summary = {
+        "faf_od_path": str(faf_od_path),
+        "origin_factor_path": str(origin_factor_path),
+        "destination_factor_path": str(destination_factor_path),
+        "output_path": str(output),
+        "year": int(year),
+        "mode": None if mode is None else str(mode),
+        "default_payload_tons": float(default_payload_tons),
+        **faf_summary,
+        "regional_faf_od_sctg_records": int(len(faf_totals)),
+        "output_county_od_records": int(len(county_od)),
+        "total_county_tons": float(county_od["tons"].sum()) if "tons" in county_od.columns else 0.0,
+        "total_county_value": float(county_od["value"].sum()) if "value" in county_od.columns else 0.0,
+        "materialized_detailed_county_od": True,
+        "preserved_sctgG5": True,
+    }
+    return county_od, summary
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build full-CONUS total county-to-county FAF5 freight OD")
     parser.add_argument(
         "--faf-od",
-        default=r"C:\Users\alimu\NIRD_Data\faf5_data\regional_od_data\FAF5.7.1_2018-2024.csv",
+        default=r"C:\Users\akothaw\Desktop\data\faf5_data\FAF5.7.1\FAF5.7.1.csv",
         help="Path to FAF5 regional OD CSV",
     )
     parser.add_argument(
         "--origin-factors",
-        default=r"C:\Users\alimu\NIRD_Data\faf5_data\county_disaggregation_factors\truck_origin_factors.csv",
+        default=r"C:\Users\akothaw\Desktop\data\faf5_data\county_disaggregation_factors\truck_origin_factors.csv",
         help="Path to truck origin county factor CSV",
     )
     parser.add_argument(
         "--destination-factors",
-        default=r"C:\Users\alimu\NIRD_Data\faf5_data\county_disaggregation_factors\truck_destination_factors.csv",
+        default=r"C:\Users\akothaw\Desktop\data\faf5_data\county_disaggregation_factors\truck_destination_factors.csv",
         help="Path to truck destination county factor CSV",
     )
     parser.add_argument(
         "--output",
-        default=r"C:\Users\alimu\NIRD_Data\faf5_data\processed\faf5_county_truck_od_usa_2022_total.parquet",
+        default=r"C:\Users\akothaw\Desktop\data\faf5_data\processed\faf5_county_truck_od_usa_2022_total.parquet",
         help="Output total county OD CSV/parquet",
     )
     parser.add_argument("--year", default="2022")
@@ -238,7 +365,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--combine-every", type=int, default=50)
     parser.add_argument(
         "--summary-json",
-        default=r"C:\Users\alimu\NIRD_Data\faf5_data\processed\faf5_county_truck_od_usa_2022_total_summary.json",
+        default=r"C:\Users\akothaw\Desktop\data\faf5_data\processed\faf5_county_truck_od_usa_2022_total_summary.json",
     )
     return parser
 
