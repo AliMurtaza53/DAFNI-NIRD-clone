@@ -18,58 +18,32 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import geopandas as gpd
 import numpy as np
-import pyproj
 import rasterio
 from rasterio.features import rasterize
 from rasterio.transform import from_origin
 from rasterio.windows import Window
 
+from nird.geo_runtime import CONUS_TARGET_CRS, canonical_crs, configure_geo_runtime, rasterio_env
 
-TARGET_CRS = "EPSG:2163"
+
+TARGET_CRS = CONUS_TARGET_CRS
 DEFAULT_RESOLUTION_M = 1000.0
 DEFAULT_BASE_DEPTH_MAX = 1.0
 DEFAULT_BASE_DEPTH_MIN = 0.05
 DEFAULT_LOW_SCALE = 0.7
 DEFAULT_HIGH_SCALE = 1.5
 
-
-def configure_proj_runtime() -> Path | None:
-    candidate_dirs = []
-    candidate_dirs.append(Path(rasterio.__file__).resolve().parent / "proj_data")
-    try:
-        proj_data_dir = pyproj.datadir.get_data_dir()
-        if proj_data_dir:
-            candidate_dirs.append(Path(proj_data_dir))
-    except Exception:
-        pass
-
-    for key in ("PROJ_DATA", "PROJ_LIB"):
-        val = os.environ.get(key)
-        if val:
-            candidate_dirs.append(Path(val))
-
-    for cdir in candidate_dirs:
-        try:
-            if cdir.exists() and (cdir / "proj.db").exists():
-                os.environ["PROJ_DATA"] = str(cdir)
-                os.environ["PROJ_LIB"] = str(cdir)
-                try:
-                    pyproj.datadir.set_data_dir(str(cdir))
-                except Exception:
-                    pass
-                return cdir
-        except Exception:
-            continue
-
-    return None
-
-
-configure_proj_runtime()
+configure_geo_runtime()
 
 
 def find_shapefile(folder: Path) -> Path:
@@ -175,48 +149,58 @@ def write_tif(
 ) -> None:
     minx, miny, maxx, maxy, width, height, transform = build_raster_spec(boundary, resolution_m)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(
-        path,
-        "w",
-        driver="GTiff",
-        height=height,
-        width=width,
-        count=1,
-        dtype="float32",
-        crs=crs,
-        transform=transform,
-        nodata=0.0,
-        compress="deflate",
-        predictor=2,
-        tiled=True,
-        blockxsize=256,
-        blockysize=256,
-    ) as dataset:
-        row_starts = list(range(0, height, block_rows))
+    write_crs = canonical_crs(crs)
+    with rasterio_env():
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=1,
+            dtype="float32",
+            crs=write_crs,
+            transform=transform,
+            nodata=0.0,
+            compress="deflate",
+            predictor=2,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+        ) as dataset:
+            row_starts = list(range(0, height, block_rows))
 
-        def compute_block(row_start: int) -> tuple[int, np.ndarray]:
-            row_stop = min(row_start + block_rows, height)
-            block_row, block = build_depth_block(
-                boundary=boundary,
-                resolution_m=resolution_m,
-                minx=minx,
-                miny=miny,
-                maxx=maxx,
-                maxy=maxy,
-                width=width,
-                row_start=row_start,
-                row_stop=row_stop,
-            )
-            return block_row, np.clip(block * scale, 0.0, None)
+            def compute_block(row_start: int) -> tuple[int, np.ndarray]:
+                row_stop = min(row_start + block_rows, height)
+                block_row, block = build_depth_block(
+                    boundary=boundary,
+                    resolution_m=resolution_m,
+                    minx=minx,
+                    miny=miny,
+                    maxx=maxx,
+                    maxy=maxy,
+                    width=width,
+                    row_start=row_start,
+                    row_stop=row_stop,
+                )
+                return block_row, np.clip(block * scale, 0.0, None)
 
-        if threads > 1:
-            with ThreadPoolExecutor(max_workers=threads) as executor:
-                for row_start, block in executor.map(compute_block, row_starts):
-                    dataset.write(block.astype("float32"), 1, window=Window(0, row_start, width, block.shape[0]))
-        else:
-            for row_start in row_starts:
-                _, block = compute_block(row_start)
-                dataset.write(block.astype("float32"), 1, window=Window(0, row_start, width, block.shape[0]))
+            if threads > 1:
+                with ThreadPoolExecutor(max_workers=threads) as executor:
+                    for row_start, block in executor.map(compute_block, row_starts):
+                        dataset.write(
+                            block.astype("float32"),
+                            1,
+                            window=Window(0, row_start, width, block.shape[0]),
+                        )
+            else:
+                for row_start in row_starts:
+                    _, block = compute_block(row_start)
+                    dataset.write(
+                        block.astype("float32"),
+                        1,
+                        window=Window(0, row_start, width, block.shape[0]),
+                    )
 
 
 def main() -> int:

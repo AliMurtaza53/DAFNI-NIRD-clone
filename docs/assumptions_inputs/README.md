@@ -93,6 +93,20 @@ Cost construction in `compute_costs_for_links()`:
 - PSV and rail fare/waiting-time adjustments are applied during OD output/cost
   aggregation, not as ordinary car assignment defaults.
 
+## Hazard Rasters And CONUS Projection
+
+CONUS freight and toy hazard workflows expect aligned projections between the FAF5
+network and hazard GeoTIFFs. See [`docs/geo_projection_conus.md`](../geo_projection_conus.md)
+for portable GDAL/PROJ setup, CRS normalization, and Script 2 troubleshooting.
+
+Toy hazard rasters (Script 2 events 1/2/3) are typically stored under:
+
+```text
+<base_path>/inputs/test_141node_50m/va_hazard_class50_141node_{base,low,high}.tif
+```
+
+Use `scripts/normalize_hazard_crs.py` when migrating rasters from another machine.
+
 ## Flood Speed Assumption
 
 Implemented in:

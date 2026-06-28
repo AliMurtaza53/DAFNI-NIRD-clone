@@ -1,5 +1,7 @@
 # CONUS Freight Script 2 Handoff - 2026-06-01
 
+For CRS/projection setup and migration on a new machine, see [`docs/geo_projection_conus.md`](docs/geo_projection_conus.md).
+
 This note captures the current repo state for moving work to another PC.
 
 ## Current Folder
