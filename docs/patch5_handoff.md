@@ -157,7 +157,9 @@ The main remaining bottleneck is stable `od_id` assignment. In the one-iteration
 
 Do not implement Patch 6 now unless explicitly requested. The deferred Patch 6 idea is to assign `od_id` during `temp_flow_matrix_input` insertion and avoid a post-hoc `ROW_NUMBER()` or full-table rewrite. This needs careful treatment of deterministic vs unordered multiprocessing behavior.
 
-## Before Unrestricted Production
+## Related docs
+
+- `docs/recovery_pass_b_progress.md` — CONUS Pass B iteration log and production tuning
 
 Complete these gates before unrestricted production:
 
