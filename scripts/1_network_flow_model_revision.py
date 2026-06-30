@@ -12,7 +12,11 @@ import geopandas as gpd  # type: ignore
 import duckdb
 
 from nird.utils import get_results_variant, load_config
-from nird.combined_od import load_combined_assignment_od, resolve_passenger_od_path
+from nird.combined_od import (
+    load_combined_assignment_od,
+    passenger_od_disabled,
+    resolve_passenger_od_path,
+)
 import nird.road_revised as func
 
 import logging
@@ -134,7 +138,11 @@ def main(
     if od_flow_col is None:
         raise ValueError("OD matrix must contain either 'Car21' or 'flow' column")
 
-    passenger_path = os.environ.get("NIRD_PASSENGER_OD_PATH") or resolve_passenger_od_path(base_path)
+    passenger_path = (
+        None
+        if passenger_od_disabled()
+        else os.environ.get("NIRD_PASSENGER_OD_PATH") or resolve_passenger_od_path(base_path)
+    )
     if passenger_path is not None:
         od_node_2021, od_stats = load_combined_assignment_od(
             od_node_2021,

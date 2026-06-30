@@ -1756,6 +1756,24 @@ def itter_path(
                 """
             )
             logging.info("Complete creating temp_flow_matrix table in Duckdb!")
+            if not create_full_temp_flow_matrix:
+                costs_df = conn.execute(
+                    """
+                    SELECT
+                        COALESCE(SUM(flow * fuel), 0.0) AS fuel_cost_total,
+                        COALESCE(SUM(flow * time), 0.0) AS time_cost_total,
+                        COALESCE(SUM(flow * toll), 0.0) AS toll_cost_total,
+                        0.0 AS fare_cost_total,
+                        COALESCE(SUM(flow), 0.0) AS assigned_flow_total
+                    FROM temp_flow_matrix
+                    """
+                ).fetchdf()
+                conn.register("temp_iteration_costs_df", costs_df)
+                conn.execute(
+                    "CREATE OR REPLACE TEMP TABLE temp_iteration_costs AS "
+                    "SELECT * FROM temp_iteration_costs_df"
+                )
+                conn.unregister("temp_iteration_costs_df")
             conn.execute(f"DROP TABLE IF EXISTS {temp_flow_table}")
             return
 

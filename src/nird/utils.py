@@ -103,8 +103,8 @@ def extract_gdf_values_containing_nodes(
 def load_config(config_path: Optional[str] = None) -> Dict[str, Dict[str, str]]:
     """Read config.json"""
     if config_path is None:
-        # config_path = "config.json"
-
+        config_path = os.environ.get("NIRD_CONFIG_PATH")
+    if config_path is None:
         config_path = os.path.join(
             os.path.dirname(__file__), "..", "..", "config.json"
         )

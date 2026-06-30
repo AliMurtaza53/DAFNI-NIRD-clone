@@ -10,6 +10,17 @@ import pandas as pd
 REQUIRED_COLUMNS = ("origin_node", "destination_node")
 
 
+def passenger_od_disabled() -> bool:
+    """Return True when pipeline scripts should skip passenger OD merge."""
+    import os
+
+    return os.getenv("NIRD_DISABLE_PASSENGER_OD", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def _normalize_assignment_od(od: pd.DataFrame, flow_col: str, source: str) -> pd.DataFrame:
     missing = set(REQUIRED_COLUMNS) - set(od.columns)
     if missing:
@@ -59,6 +70,9 @@ def resolve_passenger_od_path(
 ) -> Path | None:
     """Locate passenger assignment OD from env or standard processed paths."""
     import os
+
+    if passenger_od_disabled():
+        return None
 
     env_path = os.getenv("NIRD_PASSENGER_OD_PATH")
     if env_path:
