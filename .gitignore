@@ -124,7 +124,8 @@ _plottings*
 _plottings*
 
 # Project-specific: Data and outputs (user-specific, should not be committed)
-data/
+/data/
+.pytest-tmp/
 results/
 logs/
 profiles/
