@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import geopandas as gpd
 import pandas as pd
@@ -11,6 +12,9 @@ import pandas as pd
 DEFAULT_MAX_MAP_EDGES = int(os.getenv("NIRD_VIZ_MAX_MAP_EDGES", "50000"))
 DEFAULT_MAP_EDGE_THRESHOLD = int(os.getenv("NIRD_VIZ_MAP_EDGE_THRESHOLD", "100000"))
 VIZ_SAMPLE_STRIDE = int(os.getenv("NIRD_VIZ_SAMPLE_STRIDE", "1"))
+
+CostDisplayUnit = Literal["auto", "usd", "kusd", "musd", "busd"]
+ResolvedCostUnit = Literal["usd", "kusd", "musd", "busd"]
 
 SCTG_G5_LABELS: dict[str, str] = {
     "sctg0109": "SCTG 01-09: Ag, fish, forestry",
@@ -82,12 +86,246 @@ def event_damage_total_usd(damage_df: pd.DataFrame) -> float:
     return total_direct_damage_usd(damage_df)
 
 
+def is_testbed_variant(variant: str | None) -> bool:
+    """Return True for toy / Sioux Falls style variants used in pytest fixtures."""
+    if os.getenv("NIRD_TESTBED", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    if not variant:
+        return False
+    lower = variant.lower()
+    return lower.startswith("toy_") or "sioux_falls" in lower
+
+
+def resolve_cost_display_unit(
+    value_usd: float,
+    *,
+    unit: CostDisplayUnit = "auto",
+    variant: str | None = None,
+) -> ResolvedCostUnit:
+    """Pick a human-readable cost unit (KUSD for testbeds, MUSD for production-scale)."""
+    explicit = (unit if unit != "auto" else os.getenv("NIRD_COST_DISPLAY_UNIT", "auto")).strip().lower()
+    if explicit in {"usd", "kusd", "musd", "busd"}:
+        return explicit  # type: ignore[return-value]
+
+    abs_value = abs(float(value_usd))
+    if is_testbed_variant(variant):
+        if abs_value < 1_000_000:
+            return "kusd"
+        if abs_value < 1_000_000_000:
+            return "musd"
+        return "busd"
+
+    if abs_value < 1_000_000:
+        return "kusd"
+    if abs_value < 1_000_000_000:
+        return "musd"
+    return "busd"
+
+
+def format_cost(
+    value_usd: float,
+    *,
+    unit: CostDisplayUnit = "auto",
+    variant: str | None = None,
+) -> str:
+    """Format a USD amount using KUSD/MUSD/BUSD depending on scale and testbed mode."""
+    resolved = resolve_cost_display_unit(value_usd, unit=unit, variant=variant)
+    value = float(value_usd)
+    if resolved == "kusd":
+        return f"${value / 1_000:,.1f}K"
+    if resolved == "musd":
+        return f"${value / 1_000_000:,.2f}M"
+    if resolved == "busd":
+        return f"${value / 1_000_000_000:,.2f}B"
+    return f"${value:,.2f}"
+
+
 def format_usd_millions(value_usd: float) -> str:
-    if abs(value_usd) >= 1_000_000:
-        return f"${value_usd / 1_000_000:,.2f}M"
-    if abs(value_usd) >= 1_000:
-        return f"${value_usd / 1_000:,.1f}K"
-    return f"${value_usd:,.2f}"
+    """Backward-compatible wrapper; prefer :func:`format_cost`."""
+    return format_cost(value_usd, unit="auto")
+
+
+def _numeric_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").fillna(default)
+
+
+def _first_cost_row(cost_path: Path) -> dict[str, float]:
+    if not cost_path.exists():
+        return {}
+    costs = pd.read_csv(cost_path)
+    if costs.empty:
+        return {}
+    row = costs.iloc[0]
+    out: dict[str, float] = {}
+    for column in (
+        "total_disrupted_flow",
+        "rerouting_cost",
+        "rer_time",
+        "rer_operate",
+        "rer_toll",
+        "direct_damage_total",
+        "direct_damage_total_usd",
+        "combined_total_cost",
+    ):
+        if column in row.index:
+            out[column] = float(pd.to_numeric(row[column], errors="coerce"))
+    return out
+
+
+def _direct_damage_usd_from_cost_row(row: dict[str, float], damage_df: pd.DataFrame | None) -> float:
+    if "direct_damage_total_usd" in row:
+        return float(row["direct_damage_total_usd"])
+    if "direct_damage_total" in row:
+        return float(row["direct_damage_total"])
+    if damage_df is not None and not damage_df.empty:
+        return event_damage_total_usd(damage_df)
+    return 0.0
+
+
+def _disruption_link_metrics(links: pd.DataFrame) -> dict[str, int | float]:
+    flood_depth = _numeric_series(links, "flood_depth_max")
+    max_speed = _numeric_series(links, "max_speed", default=999.0)
+    damage_level = links.get("damage_level_max", pd.Series(dtype=object)).astype(str).str.lower()
+    flooded = int((flood_depth > 0).sum())
+    closed = int((max_speed == 0).sum())
+    damaged = int(damage_level.isin({"minor", "moderate", "extensive", "severe"}).sum())
+    return {
+        "link_count": int(len(links)),
+        "flooded_links": flooded,
+        "closed_links": closed,
+        "damaged_links": damaged,
+        "max_flood_depth_m": float(flood_depth.max()) if len(flood_depth) else 0.0,
+    }
+
+
+def _isolation_metrics(reroute_dir: Path, scenario_id: int = 1) -> dict[str, float | int]:
+    for stem in (f"trip_isolations_freight_s{scenario_id}_day1", f"trip_isolations_{scenario_id}"):
+        csv_path = reroute_dir / f"{stem}.csv"
+        if csv_path.exists():
+            iso = pd.read_csv(csv_path)
+            flow_col = "Car21" if "Car21" in iso.columns else "flow"
+            flows = _numeric_series(iso, flow_col) if flow_col in iso.columns else pd.Series(dtype=float)
+            return {
+                "isolation_rows": int(len(iso)),
+                "isolation_flow": float(flows.sum()) if len(flows) else 0.0,
+            }
+    return {"isolation_rows": 0, "isolation_flow": 0.0}
+
+
+def summarize_single_scenario(
+    results_root: Path,
+    *,
+    variant: str,
+    depth_key: int,
+    flood_key: int,
+    recovery_scenario: int = 1,
+    recovery_day: int = 1,
+) -> dict[str, float | int | str]:
+    """Collect headline QA metrics for one hazard scenario."""
+    disruption_links_path = (
+        results_root
+        / "disruption_analysis"
+        / variant
+        / str(depth_key)
+        / "links"
+        / f"road_links_{flood_key}.gpq"
+    )
+    damage_path = results_root / "damage_analysis" / variant / f"intersections_{flood_key}_with_damage_values.csv"
+    reroute_dir = (
+        results_root / "rerouting_analysis" / variant / str(depth_key) / str(flood_key)
+    )
+    freight_cost_path = reroute_dir / "cost_matrix_by_scenario.csv"
+    passenger_cost_path = reroute_dir / "cost_matrix_passenger_by_scenario.csv"
+
+    links = pd.read_parquet(disruption_links_path) if disruption_links_path.exists() else pd.DataFrame()
+    damage_df = pd.read_csv(damage_path) if damage_path.exists() else pd.DataFrame()
+    link_metrics = _disruption_link_metrics(links) if not links.empty else {
+        "link_count": 0,
+        "flooded_links": 0,
+        "closed_links": 0,
+        "damaged_links": 0,
+        "max_flood_depth_m": 0.0,
+    }
+
+    freight_row = _first_cost_row(freight_cost_path)
+    passenger_row = _first_cost_row(passenger_cost_path)
+    direct_damage_usd = _direct_damage_usd_from_cost_row(freight_row, damage_df)
+    rerouting_freight = float(freight_row.get("rerouting_cost", 0.0))
+    rerouting_passenger = float(passenger_row.get("rerouting_cost", 0.0))
+    combined_total = float(
+        freight_row.get("combined_total_cost", direct_damage_usd + rerouting_freight)
+    )
+    isolation = _isolation_metrics(reroute_dir, scenario_id=recovery_scenario)
+
+    passenger_post = reroute_dir / f"edge_flows_passenger_s{recovery_scenario}_day{recovery_day}.gpq"
+    flooded_flow_delta = 0.0
+    if passenger_post.exists():
+        post = pd.read_parquet(passenger_post)
+        flow_col = next((c for c in ("acc_flow", "flow") if c in post.columns), None)
+        flood_depth = _numeric_series(links, "flood_depth_max") if not links.empty else pd.Series(dtype=float)
+        if flow_col and not links.empty and "e_id" in post.columns:
+            flooded_ids = links.loc[flood_depth > 0, "e_id"].astype(str)
+            flooded_flow_delta = float(
+                _numeric_series(post, flow_col)
+                .loc[post["e_id"].astype(str).isin(flooded_ids)]
+                .sum()
+            )
+
+    row: dict[str, float | int | str] = {
+        "variant": variant,
+        "depth_key": int(depth_key),
+        "flood_key": int(flood_key),
+        **link_metrics,
+        "freight_disrupted_flow": float(freight_row.get("total_disrupted_flow", 0.0)),
+        "passenger_disrupted_flow": float(passenger_row.get("total_disrupted_flow", 0.0)),
+        "rerouting_cost_freight_usd": rerouting_freight,
+        "rerouting_cost_passenger_usd": rerouting_passenger,
+        "direct_damage_usd": direct_damage_usd,
+        "combined_total_usd": combined_total,
+        "passenger_flooded_edge_flow": flooded_flow_delta,
+        **isolation,
+    }
+    row["direct_damage_display"] = format_cost(direct_damage_usd, variant=variant)
+    row["rerouting_cost_freight_display"] = format_cost(rerouting_freight, variant=variant)
+    row["rerouting_cost_passenger_display"] = format_cost(rerouting_passenger, variant=variant)
+    row["combined_total_display"] = format_cost(combined_total, variant=variant)
+    return row
+
+
+def list_available_flood_keys(results_root: Path, variant: str, depth_key: int) -> list[int]:
+    links_dir = results_root / "disruption_analysis" / variant / str(depth_key) / "links"
+    if not links_dir.exists():
+        return []
+    flood_ids: list[int] = []
+    for path in links_dir.glob("road_links_*.gpq"):
+        tail = path.stem.split("_")[-1]
+        if tail.isdigit():
+            flood_ids.append(int(tail))
+    return sorted(set(flood_ids))
+
+
+def build_scenario_summary_table(
+    results_root: Path,
+    variant: str,
+    depth_key: int,
+    flood_keys: list[int] | None = None,
+) -> pd.DataFrame:
+    """Build one QA summary row per flood scenario under a variant/depth."""
+    keys = flood_keys or list_available_flood_keys(results_root, variant, depth_key)
+    if not keys:
+        return pd.DataFrame()
+    rows = [
+        summarize_single_scenario(
+            results_root,
+            variant=variant,
+            depth_key=depth_key,
+            flood_key=flood_key,
+        )
+        for flood_key in keys
+    ]
+    return pd.DataFrame(rows)
 
 
 def resolve_county_od_path(input_root: Path) -> Path | None:

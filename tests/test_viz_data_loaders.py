@@ -16,9 +16,13 @@ if str(VIZ_DIR) not in sys.path:
 from viz_data_loaders import (
     aggregate_sctg_daily_trucks,
     build_flow_validation_table,
+    build_scenario_summary_table,
     event_damage_total_usd,
+    format_cost,
     format_usd_millions,
+    is_testbed_variant,
     prepare_damage_for_viz,
+    resolve_cost_display_unit,
     summarize_od_flows,
 )
 
@@ -44,6 +48,76 @@ def test_prepare_damage_for_viz_uses_consolidated_usd() -> None:
 
 def test_format_usd_millions() -> None:
     assert format_usd_millions(1_370_000.0) == "$1.37M"
+
+
+def test_format_cost_uses_kusd_for_testbed() -> None:
+    assert format_cost(264.87, variant="toy_sioux_falls") == "$0.3K"
+    assert resolve_cost_display_unit(264.87, variant="toy_sioux_falls") == "kusd"
+
+
+def test_format_cost_uses_musd_for_production_scale() -> None:
+    assert format_cost(2_500_000.0, variant="revision") == "$2.50M"
+    assert resolve_cost_display_unit(2_500_000.0, variant="revision") == "musd"
+
+
+def test_is_testbed_variant() -> None:
+    assert is_testbed_variant("toy_sioux_falls")
+    assert not is_testbed_variant("revision")
+
+
+def test_build_scenario_summary_table(tmp_path) -> None:
+    variant = "toy_sioux_falls"
+    depth_key = 30
+    flood_key = 1
+    links_dir = (
+        tmp_path / "disruption_analysis" / variant / str(depth_key) / "links"
+    )
+    reroute_dir = tmp_path / "rerouting_analysis" / variant / str(depth_key) / str(flood_key)
+    damage_dir = tmp_path / "damage_analysis" / variant
+    links_dir.mkdir(parents=True)
+    reroute_dir.mkdir(parents=True)
+    damage_dir.mkdir(parents=True)
+
+    links = pd.DataFrame(
+        {
+            "e_id": ["e1", "e2"],
+            "flood_depth_max": [0.5, 0.0],
+            "max_speed": [0.0, 45.0],
+            "damage_level_max": ["moderate", "no"],
+        }
+    )
+    links.to_parquet(links_dir / f"road_links_{flood_key}.gpq", index=False)
+    pd.DataFrame(
+        {
+            "scenario": [1],
+            "event_day": [1],
+            "total_disrupted_flow": [0.0],
+            "rerouting_cost": [0.0],
+            "direct_damage_total_usd": [12_345.0],
+            "combined_total_cost": [12_345.0],
+        }
+    ).to_csv(reroute_dir / "cost_matrix_by_scenario.csv", index=False)
+    pd.DataFrame(
+        {
+            "scenario": [1],
+            "event_day": [1],
+            "total_disrupted_flow": [100.0],
+            "rerouting_cost": [-50.0],
+            "direct_damage_total_usd": [12_345.0],
+            "combined_total_cost": [12_295.0],
+        }
+    ).to_csv(reroute_dir / "cost_matrix_passenger_by_scenario.csv", index=False)
+    pd.DataFrame({"e_id": ["e1"], "C5_surface_damage_value_mean": [0.01]}).to_csv(
+        damage_dir / f"intersections_{flood_key}_with_damage_values.csv",
+        index=False,
+    )
+
+    summary = build_scenario_summary_table(tmp_path, variant, depth_key, flood_keys=[flood_key])
+    assert len(summary) == 1
+    row = summary.iloc[0]
+    assert row["flooded_links"] == 1
+    assert row["passenger_disrupted_flow"] == pytest.approx(100.0)
+    assert row["direct_damage_display"] == "$12.3K"
 
 
 def test_aggregate_sctg_daily_trucks() -> None:
