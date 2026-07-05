@@ -515,9 +515,13 @@ def edge_init(
 
     # initialise key variables
     road_links["acc_flow"] = 0.0
-    road_links["acc_capacity"] = (
-        road_links["combined_label"].map(capacity_plph_dict) * road_links["lanes"] * 24
-    )
+    if "flow_cap_plph" in road_links.columns:
+        per_lane_plph = pd.to_numeric(road_links["flow_cap_plph"], errors="coerce")
+        road_links["acc_capacity"] = per_lane_plph * road_links["lanes"] * 24
+    else:
+        road_links["acc_capacity"] = (
+            road_links["combined_label"].map(capacity_plph_dict) * road_links["lanes"] * 24
+        )
     road_links["acc_speed"] = road_links["initial_flow_speeds"]
     # current state mirrors initial state
     road_links["current_capacity"] = road_links["acc_capacity"]

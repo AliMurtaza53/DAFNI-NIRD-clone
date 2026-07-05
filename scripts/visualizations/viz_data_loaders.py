@@ -161,6 +161,7 @@ def _first_cost_row(cost_path: Path) -> dict[str, float]:
     out: dict[str, float] = {}
     for column in (
         "total_disrupted_flow",
+        "total_disrupted_flow_unique_od",
         "rerouting_cost",
         "rer_time",
         "rer_operate",
@@ -201,17 +202,29 @@ def _disruption_link_metrics(links: pd.DataFrame) -> dict[str, int | float]:
 
 
 def _isolation_metrics(reroute_dir: Path, scenario_id: int = 1) -> dict[str, float | int]:
-    for stem in (f"trip_isolations_freight_s{scenario_id}_day1", f"trip_isolations_{scenario_id}"):
+    out: dict[str, float | int] = {
+        "isolation_rows": 0,
+        "isolation_flow": 0.0,
+        "isolation_rows_freight": 0,
+        "isolation_flow_freight": 0.0,
+        "isolation_rows_passenger": 0,
+        "isolation_flow_passenger": 0.0,
+    }
+    for mode, stem in (
+        ("freight", f"trip_isolations_freight_s{scenario_id}_day1"),
+        ("passenger", f"trip_isolations_passenger_s{scenario_id}_day1"),
+    ):
         csv_path = reroute_dir / f"{stem}.csv"
-        if csv_path.exists():
-            iso = pd.read_csv(csv_path)
-            flow_col = "Car21" if "Car21" in iso.columns else "flow"
-            flows = _numeric_series(iso, flow_col) if flow_col in iso.columns else pd.Series(dtype=float)
-            return {
-                "isolation_rows": int(len(iso)),
-                "isolation_flow": float(flows.sum()) if len(flows) else 0.0,
-            }
-    return {"isolation_rows": 0, "isolation_flow": 0.0}
+        if not csv_path.exists():
+            continue
+        iso = pd.read_csv(csv_path)
+        flow_col = "Car21" if "Car21" in iso.columns else "flow"
+        flows = _numeric_series(iso, flow_col) if flow_col in iso.columns else pd.Series(dtype=float)
+        out[f"isolation_rows_{mode}"] = int(len(iso))
+        out[f"isolation_flow_{mode}"] = float(flows.sum()) if len(flows) else 0.0
+    out["isolation_rows"] = int(out["isolation_rows_freight"] + out["isolation_rows_passenger"])
+    out["isolation_flow"] = float(out["isolation_flow_freight"] + out["isolation_flow_passenger"])
+    return out
 
 
 def summarize_single_scenario(
@@ -251,6 +264,18 @@ def summarize_single_scenario(
 
     freight_row = _first_cost_row(freight_cost_path)
     passenger_row = _first_cost_row(passenger_cost_path)
+    freight_disrupted = float(
+        freight_row.get(
+            "total_disrupted_flow_unique_od",
+            freight_row.get("total_disrupted_flow", 0.0),
+        )
+    )
+    passenger_disrupted = float(
+        passenger_row.get(
+            "total_disrupted_flow_unique_od",
+            passenger_row.get("total_disrupted_flow", 0.0),
+        )
+    )
     direct_damage_usd = _direct_damage_usd_from_cost_row(freight_row, damage_df)
     rerouting_freight = float(freight_row.get("rerouting_cost", 0.0))
     rerouting_passenger = float(passenger_row.get("rerouting_cost", 0.0))
@@ -278,8 +303,10 @@ def summarize_single_scenario(
         "depth_key": int(depth_key),
         "flood_key": int(flood_key),
         **link_metrics,
-        "freight_disrupted_flow": float(freight_row.get("total_disrupted_flow", 0.0)),
-        "passenger_disrupted_flow": float(passenger_row.get("total_disrupted_flow", 0.0)),
+        "freight_disrupted_flow": freight_disrupted,
+        "passenger_disrupted_flow": passenger_disrupted,
+        "freight_disrupted_flow_raw": float(freight_row.get("total_disrupted_flow", 0.0)),
+        "passenger_disrupted_flow_raw": float(passenger_row.get("total_disrupted_flow", 0.0)),
         "rerouting_cost_freight_usd": rerouting_freight,
         "rerouting_cost_passenger_usd": rerouting_passenger,
         "direct_damage_usd": direct_damage_usd,

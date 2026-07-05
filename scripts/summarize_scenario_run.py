@@ -101,6 +101,7 @@ def main() -> int:
 
     display_cols = [
         "flood_key",
+        "link_count",
         "flooded_links",
         "closed_links",
         "damaged_links",
@@ -110,7 +111,10 @@ def main() -> int:
         "rerouting_cost_passenger_display",
         "direct_damage_display",
         "combined_total_display",
-        "isolation_rows",
+        "isolation_rows_freight",
+        "isolation_rows_passenger",
+        "isolation_flow_freight",
+        "isolation_flow_passenger",
         "passenger_flooded_edge_flow",
     ]
     present = [col for col in display_cols if col in summary.columns]

@@ -125,8 +125,8 @@ def _assert_pipeline_outputs(tmp_path, env, spec) -> None:
 
     flooded_freight = _flow_on_edge(freight_post, spec.flooded_edge_id)
     flooded_passenger = _flow_on_edge(passenger_post, spec.flooded_edge_id)
-    assert flooded_freight == pytest.approx(-spec.expected_reroute_flow_freight)
-    assert flooded_passenger == pytest.approx(-spec.expected_reroute_flow_passenger)
+    assert flooded_freight == pytest.approx(-spec.expected_disrupted_flow_freight)
+    assert flooded_passenger == pytest.approx(-spec.expected_disrupted_flow_passenger)
 
 
 @pytest.mark.parametrize("network_name", ["three_parallel", "braess"])

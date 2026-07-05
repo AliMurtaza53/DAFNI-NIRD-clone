@@ -76,28 +76,34 @@ def load_odpfc_source(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def overlay_passenger_flows(
+def overlay_assignment_flows(
     disrupted_candidates: pd.DataFrame,
-    passenger_od: pd.DataFrame,
+    assignment_od: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Restrict disrupted path candidates to passenger OD pairs and use passenger demand."""
-    passenger = passenger_od.copy()
+    """Overlay raw assignment demand onto one disrupted candidate row per OD pair."""
+    demand = assignment_od.copy()
     for col in ("origin_node", "destination_node"):
-        if col not in passenger.columns:
-            raise ValueError(f"Passenger OD missing {col}")
-        passenger[col] = passenger[col].astype(str)
-    flow_col = "Car21" if "Car21" in passenger.columns else "flow"
-    passenger = passenger.groupby(["origin_node", "destination_node"], as_index=False)[flow_col].sum()
-    passenger = passenger[passenger[flow_col] > 0]
+        if col not in demand.columns:
+            raise ValueError(f"Assignment OD missing {col}")
+        demand[col] = demand[col].astype(str)
+    flow_col = "Car21" if "Car21" in demand.columns else "flow"
+    demand = demand.groupby(["origin_node", "destination_node"], as_index=False)[flow_col].sum()
+    demand = demand[demand[flow_col] > 0]
 
     candidates = disrupted_candidates.copy()
     if "origin_node" not in candidates.columns or "destination_node" not in candidates.columns:
-        raise ValueError("disrupted_candidates must include origin_node and destination_node for passenger overlay")
+        raise ValueError(
+            "disrupted_candidates must include origin_node and destination_node for demand overlay"
+        )
     candidates["origin_node"] = candidates["origin_node"].astype(str)
     candidates["destination_node"] = candidates["destination_node"].astype(str)
+    candidates = candidates.drop_duplicates(
+        subset=["origin_node", "destination_node"],
+        keep="first",
+    )
 
     merged = candidates.merge(
-        passenger,
+        demand,
         on=["origin_node", "destination_node"],
         how="inner",
     )
@@ -105,6 +111,14 @@ def overlay_passenger_flows(
     if flow_col != "flow" and flow_col in merged.columns:
         merged = merged.drop(columns=[flow_col])
     return merged.reset_index(drop=True)
+
+
+def overlay_passenger_flows(
+    disrupted_candidates: pd.DataFrame,
+    passenger_od: pd.DataFrame,
+) -> pd.DataFrame:
+    """Restrict disrupted path candidates to passenger OD pairs and use passenger demand."""
+    return overlay_assignment_flows(disrupted_candidates, passenger_od)
 
 
 def safe_event_id(value) -> str:
@@ -637,6 +651,7 @@ def main(
 
     base_disrupted_candidates = disrupted_candidates.copy()
     passenger_od_df = None
+    freight_od_df = None
     if os.environ.get("NIRD_ENABLE_PASSENGER_REROUTING", "0").strip().lower() in {
         "1",
         "true",
@@ -649,7 +664,20 @@ def main(
         else:
             logging.warning("Passenger rerouting enabled but passenger OD path not found.")
 
-    reroute_modes: list[tuple[str, pd.DataFrame]] = [("freight", base_disrupted_candidates)]
+    for freight_candidate in (
+        base_path / "inputs" / "census_datasets" / "faf5_od_matrix.pq",
+        base_path / "census_datasets" / "faf5_od_matrix.pq",
+    ):
+        if freight_candidate.exists():
+            freight_od_df = pd.read_parquet(freight_candidate)
+            logging.info("Loaded freight assignment OD from %s (%s rows)", freight_candidate, len(freight_od_df))
+            break
+
+    if freight_od_df is not None:
+        freight_candidates = overlay_assignment_flows(base_disrupted_candidates, freight_od_df)
+    else:
+        freight_candidates = base_disrupted_candidates.copy()
+    reroute_modes: list[tuple[str, pd.DataFrame]] = [("freight", freight_candidates)]
     if passenger_od_df is not None:
         reroute_modes.append(
             ("passenger", overlay_passenger_flows(base_disrupted_candidates, passenger_od_df))
@@ -746,12 +774,18 @@ def main(
                 chunk = chunk.explode("flood_links")  # list of e_id
                 if chunk.empty:
                     continue
+                link_cols = ["e_id", "acc_capacity"]
+                if "max_speed" in road_links.columns:
+                    link_cols.append("max_speed")
                 chunk = chunk.merge(
-                    road_links[["e_id", "acc_capacity"]],
+                    road_links[link_cols],
                     how="left",
                     left_on="flood_links",
                     right_on="e_id",
                 )
+                if "max_speed" in chunk.columns:
+                    closed = pd.to_numeric(chunk["max_speed"], errors="coerce").fillna(999) <= 0
+                    chunk.loc[closed, "acc_capacity"] = 0
                 od_df = chunk.groupby(by=["od_id"])["acc_capacity"].min().reset_index()
                 if first:
                     conn.register("od_df", od_df)
@@ -783,7 +817,13 @@ def main(
                 drop=True
             )
             total_disrupted_flow = float(disrupted_od.disrupted_flow.sum())
+            unique_disrupted_flow = float(
+                disrupted_od.groupby(["origin_node", "destination_node"])["disrupted_flow"]
+                .sum()
+                .sum()
+            )
             logging.info(f"The total disrupted flows: {total_disrupted_flow}")
+            logging.info(f"The unique-OD disrupted flows: {unique_disrupted_flow}")
 
             # estimate the pre-event cost matrix for disrupted flows
             pre_time = (disrupted_od.disrupted_flow * disrupted_od.time_cost_per_flow).sum()
@@ -972,6 +1012,7 @@ def main(
                     "scenario": scenario_id,
                     "event_day": event_day,
                     "total_disrupted_flow": total_disrupted_flow,
+                    "total_disrupted_flow_unique_od": unique_disrupted_flow,
                     "rer_time": rer_time,
                     "rer_operate": rer_operate,
                     "rer_toll": rer_toll,
